@@ -176,7 +176,7 @@ export default function App() {
   }
   function resolve(proposal: Proposal, outcome: "approve" | "reject") {
     try {
-      const result = resolveApproval({ id: proposal.id, status: proposal.status as "pending" | "approved" | "rejected" }, outcome, "workspace.operator");
+      const result = resolveApproval<{ id: string; status: "pending" | "approved" | "rejected"; reviewer?: string; reviewedAt?: string }>({ id: proposal.id, status: proposal.status as "pending" | "approved" | "rejected" }, outcome, "workspace.operator");
       setProposals((items) => items.map((p) => p.id === proposal.id ? { ...p, status: result.status as RequestStatus, reviewer: result.reviewer, reviewedAt: result.reviewedAt } : p));
       log(outcome === "approve" ? "APPROVED" : "REJECTED", outcome === "approve" ? "Request approved locally" : "Request rejected", proposal.summary + " · " + proposal.resource, "workspace.operator");
       setNotice(outcome === "approve" ? "Local approval recorded. Production integrations must enforce approval server-side." : "Request rejected and recorded locally.");
