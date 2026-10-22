@@ -17,6 +17,11 @@ jobs:
         with:
           node-version: 22
       - run: npm install
+      - name: Report dependency advisories
+        shell: bash
+        run: |
+          npm audit --json > /tmp/backstop-audit.json || true
+          node -e 'const a=require("/tmp/backstop-audit.json"); for (const [name,v] of Object.entries(a.vulnerabilities||{})) console.log(JSON.stringify({name,severity:v.severity,range:v.range,fixAvailable:v.fixAvailable,via:v.via.map(x=>typeof x==="string"?x:{title:x.title,url:x.url,range:x.range})}));'
       - run: npm test
       - run: npm run check
       - run: npm run build
