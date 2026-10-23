@@ -356,13 +356,25 @@ export function createPostgresApprovalService(
   }
 
   return {
-    async listPending(organizationId: string, limit = 20, offset = 0): Promise<ApprovalQueueItem[]> {
-      if (typeof organizationId !== "string" || !organizationId.trim()) {
-        throw new Error("A trusted organization ID is required.");
+    async listPending(input: {
+      organizationId: string;
+      reviewerId: string;
+      limit?: number;
+      offset?: number;
+    }): Promise<ApprovalQueueItem[]> {
+      if (!input || typeof input.organizationId !== "string" || !input.organizationId.trim()
+        || typeof input.reviewerId !== "string" || !input.reviewerId.trim()) {
+        throw new Error("A trusted organization ID and reviewer ID are required.");
       }
-      if (!Number.isInteger(limit) || limit < 1 || limit > 100
-        || !Number.isInteger(offset) || offset < 0 || offset > 100000) {
+      if (!Number.isInteger(input.limit ?? 20) || (input.limit ?? 20) < 1 || (input.limit ?? 20) > 100
+        || !Number.isInteger(input.offset ?? 0) || (input.offset ?? 0) < 0 || (input.offset ?? 0) > 100000) {
         throw new Error("Pagination limit must be 1–100 and offset must be between 0 and 100000.");
+      }
+      if (!await options.authorizeReviewer({
+        organizationId: input.organizationId,
+        reviewerId: input.reviewerId,
+      })) {
+        throw new Error("This reviewer is not permitted to view approvals for the organization.");
       }
       const result = await pool.query<StoredApprovalRow & {
         created_at: unknown;
@@ -374,7 +386,7 @@ export function createPostgresApprovalService(
          WHERE organization_id = $1 AND status = 'pending' AND expires_at > now()
          ORDER BY created_at ASC, request_id ASC
          LIMIT $2 OFFSET $3`,
-        [organizationId, limit, offset],
+        [input.organizationId, input.limit ?? 20, input.offset ?? 0],
       );
       return result.rows.map((row) => {
         if (!isActionType(row.action_type) || !DIGEST.test(String(row.input_digest).trim())) {
