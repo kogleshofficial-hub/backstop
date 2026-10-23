@@ -30,13 +30,13 @@ describe("policy evaluation", () => {
     const allowDelete = { ...DEFAULT_RULES[2], id: "bad-allow", actionTypes: ["delete_resource"] as const, effect: "ALLOW" as const, locked: false };
     expect(evaluateAction(request({ actionType: "delete_resource" }), [allowDelete]).decision).toBe("BLOCK");
   });
-  it("fails closed when custom policy configuration is malformed", () => {
-    expect(evaluateAction(request({ actionType: "write_resource" }), [null as unknown as PolicyRule]).decision).toBe("REQUIRE_APPROVAL");
-    expect(evaluateAction(request({ actionType: "write_resource" }), null as unknown as PolicyRule[]).decision).toBe("REQUIRE_APPROVAL");
+  it("blocks when custom policy configuration is malformed", () => {
+    expect(evaluateAction(request({ actionType: "write_resource" }), [null as unknown as PolicyRule]).decision).toBe("BLOCK");
+    expect(evaluateAction(request({ actionType: "write_resource" }), null as unknown as PolicyRule[]).decision).toBe("BLOCK");
   });
-  it("rejects custom rules that attempt to grant permissions", () => {
+  it("blocks custom rules that attempt to grant permissions", () => {
     const allowRead = { ...DEFAULT_RULES[2], id: "custom-allow", locked: false };
-    expect(evaluateAction(request(), [allowRead]).decision).toBe("REQUIRE_APPROVAL");
+    expect(evaluateAction(request(), [allowRead]).decision).toBe("BLOCK");
   });
   it("returns human-readable reason and policy version", () => {
     const result = evaluateAction(request({ actionType: "write_resource" }));
