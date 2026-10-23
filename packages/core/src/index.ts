@@ -62,7 +62,7 @@ export function evaluateAction(request: ActionRequest, customRules: readonly Pol
  // Treat externally supplied policy as untrusted configuration. An invalid or permissive
  // custom rule must never silently weaken the baseline or turn an unknown state into ALLOW.
  if(!Array.isArray(customRules) || !customRules.every(isValidCustomRule))
-  return requireReview("Policy configuration is invalid or attempts to grant permissions. Review the policy before execution.");
+  return {decision:"BLOCK",reason:"Policy configuration is invalid or attempts to grant permissions. Blocked until a trusted policy is restored.",matchedRules:[],policyVersion:POLICY_VERSION};
  const matches=[...DEFAULT_RULES,...customRules].filter((rule)=>matchesRule(rule,request)).sort((a,b)=>weight[b.effect]-weight[a.effect]||b.priority-a.priority);
  if(!matches.length) return requireReview("No enabled policy matched. Backstop defaults to human review.");
  return {decision:matches[0].effect,reason:matches[0].description,matchedRules:matches,policyVersion:POLICY_VERSION};
