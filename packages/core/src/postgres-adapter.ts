@@ -296,3 +296,180 @@ export function createPostgresExecutionGateDependencies(
     },
   };
 }
+
+
+export interface ApprovalQueueItem {
+  requestId: string;
+  agentId: string;
+  toolName: string;
+  actionType: ActionType;
+  resource: string;
+  summary: string;
+  inputDigest: string;
+  policyVersion: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface ApprovalReviewResult {
+  status: "approved" | "rejected";
+  requestId: string;
+  approval?: { requestId: string; approvalId: string };
+}
+
+export interface PostgresApprovalServiceOptions {
+  /** Always pass reviewer identity obtained from trusted server-side authentication. */
+  authorizeReviewer(input: { organizationId: string; reviewerId: string }): Promise<boolean>;
+}
+
+function toIso(value: unknown, field: string): string {
+  const date = value instanceof Date ? value : new Date(String(value));
+  if (!Number.isFinite(date.getTime())) throw new Error(`Invalid stored timestamp: ${field}.`);
+  return date.toISOString();
+}
+
+function secureApprovalId(): string {
+  if (typeof globalThis.crypto?.randomUUID !== "function") {
+    throw new Error("A cryptographically secure UUID generator is required for approval IDs.");
+  }
+  return `bsa_${globalThis.crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+/**
+ * Durable approval queue for trusted server routes.
+ *
+ * Call listPending only after the route has authenticated a reviewer and resolved the
+ * organization from trusted membership data. Call review with the reviewer ID from that
+ * same authenticated session, never from request JSON.
+ */
+export function createPostgresApprovalService(
+  pool: PgPool,
+  options: PostgresApprovalServiceOptions,
+) {
+  if (!pool || typeof pool.query !== "function" || typeof pool.connect !== "function") {
+    throw new Error("A compatible PostgreSQL pool is required.");
+  }
+  if (typeof options?.authorizeReviewer !== "function") {
+    throw new Error("A reviewer authorization callback is required.");
+  }
+
+  return {
+    async listPending(organizationId: string, limit = 20, offset = 0): Promise<ApprovalQueueItem[]> {
+      if (typeof organizationId !== "string" || !organizationId.trim()) {
+        throw new Error("A trusted organization ID is required.");
+      }
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100
+        || !Number.isInteger(offset) || offset < 0 || offset > 100000) {
+        throw new Error("Pagination limit must be 1–100 and offset must be between 0 and 100000.");
+      }
+      const result = await pool.query<StoredApprovalRow & {
+        created_at: unknown;
+        expires_at: unknown;
+      }>(
+        `SELECT request_id, agent_id, tool_name, action_type, resource, summary, input_digest,
+                policy_version, created_at, expires_at
+         FROM backstop_approval_requests
+         WHERE organization_id = $1 AND status = 'pending' AND expires_at > now()
+         ORDER BY created_at ASC, request_id ASC
+         LIMIT $2 OFFSET $3`,
+        [organizationId, limit, offset],
+      );
+      return result.rows.map((row) => {
+        if (!isActionType(row.action_type) || !DIGEST.test(String(row.input_digest).trim())) {
+          throw new Error("Stored approval request contains an invalid action type or input digest.");
+        }
+        return {
+          requestId: nonEmptyString(row.request_id, "request_id"),
+          agentId: nonEmptyString(row.agent_id, "agent_id"),
+          toolName: nonEmptyString(row.tool_name, "tool_name"),
+          actionType: row.action_type,
+          resource: nonEmptyString(row.resource, "resource"),
+          summary: nonEmptyString(row.summary, "summary"),
+          inputDigest: String(row.input_digest).trim(),
+          policyVersion: nonEmptyString(row.policy_version, "policy_version"),
+          createdAt: toIso(row.created_at, "created_at"),
+          expiresAt: toIso(row.expires_at, "expires_at"),
+        };
+      });
+    },
+
+    async review(input: {
+      organizationId: string;
+      requestId: string;
+      reviewerId: string;
+      outcome: "approve" | "reject";
+    }): Promise<ApprovalReviewResult> {
+      if (!input || typeof input.organizationId !== "string" || !input.organizationId.trim()
+        || typeof input.requestId !== "string" || !input.requestId.trim()
+        || typeof input.reviewerId !== "string" || !input.reviewerId.trim()
+        || (input.outcome !== "approve" && input.outcome !== "reject")) {
+        throw new Error("Organization, request, reviewer, and decision are required.");
+      }
+      if (!await options.authorizeReviewer({
+        organizationId: input.organizationId,
+        reviewerId: input.reviewerId,
+      })) {
+        throw new Error("This reviewer is not permitted to review requests for the organization.");
+      }
+
+      const client = await pool.connect();
+      let begun = false;
+      try {
+        await client.query("BEGIN");
+        begun = true;
+        const selected = await client.query<StoredApprovalRow>(
+          `SELECT organization_id, request_id, agent_id, tool_name, action_type, resource, summary,
+                  input_digest, policy_version, status, reviewer_id, approval_id, expires_at
+           FROM backstop_approval_requests
+           WHERE organization_id = $1 AND request_id = $2
+             AND status = 'pending' AND expires_at > now()
+           FOR UPDATE`,
+          [input.organizationId, input.requestId],
+        );
+        const row = selected.rows[0];
+        if (!row) throw new Error("Approval request is missing, expired, or already reviewed.");
+        if (!isActionType(row.action_type) || !DIGEST.test(String(row.input_digest).trim())) {
+          throw new Error("Stored approval request contains invalid action metadata.");
+        }
+
+        const decision = input.outcome === "approve" ? "APPROVAL_APPROVED" : "APPROVAL_REJECTED";
+        const nextStatus = input.outcome === "approve" ? "approved" : "rejected";
+        const approvalId = input.outcome === "approve" ? secureApprovalId() : null;
+        const updated = await client.query<{ request_id: unknown }>(
+          `UPDATE backstop_approval_requests
+           SET status = $3, reviewer_id = $4, approval_id = $5, updated_at = now()
+           WHERE organization_id = $1 AND request_id = $2
+             AND status = 'pending' AND expires_at > now()
+           RETURNING request_id`,
+          [input.organizationId, input.requestId, nextStatus, input.reviewerId, approvalId],
+        );
+        if (updated.rows.length !== 1) throw new Error("Approval request changed before the review could be saved.");
+
+        await client.query(
+          `INSERT INTO backstop_audit_events
+             (occurred_at, organization_id, request_id, agent_id, tool_name, kind, decision,
+              policy_version, action_type, resource, input_digest, reason)
+           VALUES (now(),$1,$2,$3,$4,$5,'REQUIRE_APPROVAL',$6,$7,$8,$9,$10)`,
+          [
+            input.organizationId, input.requestId, input.reviewerId, row.tool_name, decision,
+            row.policy_version, row.action_type, row.resource, String(row.input_digest).trim(),
+            input.outcome === "approve" ? "Authorized reviewer approved the pending request." : "Authorized reviewer rejected the pending request.",
+          ],
+        );
+
+        await client.query("COMMIT");
+        begun = false;
+        return input.outcome === "approve"
+          ? { status: "approved", requestId: input.requestId, approval: { requestId: input.requestId, approvalId: approvalId! } }
+          : { status: "rejected", requestId: input.requestId };
+      } catch (error) {
+        if (begun) {
+          try { await client.query("ROLLBACK"); } catch { /* Preserve the original error. */ }
+        }
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+  };
+}
