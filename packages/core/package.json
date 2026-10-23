@@ -1,7 +1,7 @@
 {
   "name": "@backstop/core",
   "version": "0.1.0",
-  "description": "Deterministic policy evaluation and regression testing for AI agent actions",
+  "description": "Deterministic AI action policies and server-side execution gate",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,9 +13,18 @@
     "./scenarios": {
       "types": "./dist/scenarios.d.ts",
       "import": "./dist/scenarios.js"
+    },
+    "./execution-gate": {
+      "types": "./dist/execution-gate.d.ts",
+      "import": "./dist/execution-gate.js"
     }
   },
-  "files": ["dist", "README.md"],
-  "scripts": {"build": "tsc -p tsconfig.json"},
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
   "license": "Apache-2.0"
 }
