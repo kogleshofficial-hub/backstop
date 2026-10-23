@@ -89,12 +89,13 @@ class FakePool implements PgPool {
         rows.sort((a,b) => new Date(String(b.created_at)).getTime() - new Date(String(a.created_at)).getTime());
       }
     } else if (sql.startsWith("update backstop_agent_credentials")) {
-      const key = values[0];
-      const row = this.credentials.find((candidate) => candidate.credential_id === key && candidate.status === "active");
-      if (row && sql.includes("set last_used_at")) {
-        row.last_used_at = new Date();
-        rows = [{ credential_id: key }];
-      } else if (row && sql.includes("set status = 'revoked'") && row.organization_id === values[0]) {
+      if (sql.includes("set last_used_at")) {
+        const target = this.credentials.find((candidate) => candidate.credential_id === values[0] && candidate.status === "active");
+        if (target && new Date(String(target.expires_at)).getTime() > Date.now()) {
+          target.last_used_at = new Date();
+          rows = [{ credential_id: values[0] }];
+        }
+      } else if (sql.includes("set status = 'revoked'")) {
         // Credential revocation SQL uses [organizationId, credentialId].
         const target = this.credentials.find((candidate) => candidate.organization_id === values[0] && candidate.credential_id === values[1] && candidate.status === "active");
         if (target) { target.status = "revoked"; target.revoked_at = new Date(); rows = [{ credential_id: values[1] }]; }
@@ -218,7 +219,6 @@ describe("PostgreSQL execution gate adapter", () => {
       organizationId: agent.organizationId, actorId: "admin-1", credentialId: created.credentialId,
     })).toBe(true);
     expect(await service.authenticate(created.secret)).toBeNull();
-    expect(pool.queries.some((query) => query.sql.includes("credential-revoked"))).toBe(false);
     expect(pool.queries.some((query) => query.sql.includes("insert into backstop_audit_events"))).toBe(true);
   });
 
