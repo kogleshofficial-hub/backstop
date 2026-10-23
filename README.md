@@ -12,6 +12,7 @@ BACKSTOP is infrastructure for developers who want agent actions checked before 
 - Policy scenario runner for regression tests.
 - Server-side gate with fixed server-registered tool/action mapping, authenticated principal contract, app-level resource authorization, canonical input snapshot and SHA-256 digest.
 - Durable approval request records and atomic approval consumption contract.
+- Transactional policy publishing with versioned organization rules; custom policies are validated and can only restrict.
 - PostgreSQL adapter for versioned organization policies, pending approval queue, reviewer decisions, one-time execution claims, and audit event inserts.
 - Machine API credentials generated from cryptographically random tokens, stored as hashes, scoped to allowed actions, expiring by default, and revocable.
 - Starter PostgreSQL schema at `packages/core/migrations/001_execution_control.sql`.
@@ -40,12 +41,12 @@ npm audit --audit-level=high
 
 ## Use the execution gate
 
-The gate and adapter are package entry points:
+The gate, storage, and policy-management APIs are package entry points:
 
 - `@backstop/core/execution-gate`
 - `@backstop/core/postgres-adapter`
 - `@backstop/core/scenarios`
-- `@backstop/core/postgres-adapter` — PostgreSQL storage, approval queue, and machine credential service
+- `@backstop/core/postgres-adapter` — PostgreSQL storage, approval queue, machine credential service, and versioned policy manager
 
 The PostgreSQL adapter accepts a compatible `pg.Pool`. Install the host app's database client with `npm install pg` and `npm install -D @types/pg`, configure `DATABASE_URL` as a server-side secret, then apply the schema with:
 
