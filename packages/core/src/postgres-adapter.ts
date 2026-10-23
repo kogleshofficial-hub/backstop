@@ -827,12 +827,15 @@ function normalizePublishRules(rules: readonly PolicyRule[]): PolicyRule[] {
     if (rule.effect !== "BLOCK" && rule.effect !== "REQUIRE_APPROVAL") {
       throw new Error("Custom organization policies cannot grant ALLOW permissions.");
     }
-    if (!Array.isArray(rule.actionTypes) || rule.actionTypes.length < 1 || rule.actionTypes.length > ACTION_CATALOG.length
-      || !rule.actionTypes.every(isActionType)) {
+    const rawActionTypes: unknown = rule.actionTypes;
+    if (!Array.isArray(rawActionTypes) || rawActionTypes.length < 1 || rawActionTypes.length > ACTION_CATALOG.length
+      || !rawActionTypes.every(isActionType)) {
       throw new Error("Policy rule contains an invalid action scope.");
     }
-    if (!Array.isArray(rule.resources) || rule.resources.length < 1 || rule.resources.length > 100
-      || !rule.resources.every((resource) => typeof resource === "string" && !!resource.trim() && resource.length <= 1024)) {
+    const rawResources: unknown = rule.resources;
+    if (!Array.isArray(rawResources) || rawResources.length < 1 || rawResources.length > 100
+      || !rawResources.every((resource: unknown) =>
+        typeof resource === "string" && !!resource.trim() && resource.length <= 1024)) {
       throw new Error("Policy rule contains invalid resource patterns.");
     }
     if (typeof rule.enabled !== "boolean" || typeof rule.priority !== "number"
@@ -844,8 +847,8 @@ function normalizePublishRules(rules: readonly PolicyRule[]): PolicyRule[] {
       name: rule.name.trim(),
       description: rule.description.trim(),
       effect: rule.effect,
-      actionTypes: [...new Set(rule.actionTypes)],
-      resources: [...new Set(rule.resources.map((resource) => resource.trim()))],
+      actionTypes: [...new Set(rawActionTypes as ActionType[])],
+      resources: [...new Set((rawResources as string[]).map((resource: string) => resource.trim()))],
       enabled: rule.enabled,
       priority: Math.trunc(rule.priority),
       locked: false,
