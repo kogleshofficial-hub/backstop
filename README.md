@@ -1,20 +1,23 @@
 # BACKSTOP
 
-**Policy enforcement and testing for AI agent actions.**
+**A deterministic policy gate and approval workflow for AI agent actions.**
 
-BACKSTOP provides a deterministic TypeScript policy engine and an embeddable server-side execution gate. It evaluates proposed tool actions as **ALLOW**, **BLOCK**, or **REQUIRE_APPROVAL** before the registered operation can run.
+BACKSTOP is infrastructure for developers who want agent actions checked before real tools run. It provides a TypeScript policy engine, an embeddable server-side execution gate, PostgreSQL storage/approval adapters, and a local console for inspecting policy decisions.
 
-## What is in this repository
+## What is implemented
 
-- Deterministic policy engine with restrictive custom rules and locked baseline blocks.
-- Fail-closed handling of malformed requests and invalid custom policy configuration.
-- Model-free policy scenario runner for regression checks.
-- Server-side execution-gate library that binds fixed tool definitions to action types, checks the authenticated agent's action allowlist and resource authorization, verifies approval evidence for review-gated actions, and refuses execution when pre-execution audit storage fails.
-- Local browser console for exploring requests and policies.
-- Unit tests and GitHub Actions CI.
-- No AI API or paid model credits required.
+- Deterministic `ALLOW`, `BLOCK`, and `REQUIRE_APPROVAL` policy evaluation.
+- Locked baseline blocks for destructive deletion and money transfers.
+- Fail-closed checks for malformed requests and invalid custom policy configuration.
+- Policy scenario runner for regression tests.
+- Server-side gate with fixed server-registered tool/action mapping, authenticated principal contract, app-level resource authorization, canonical input snapshot and SHA-256 digest.
+- Durable approval request records and atomic approval consumption contract.
+- PostgreSQL adapter for versioned organization policies, pending approval queue, reviewer decisions, one-time execution claims, and audit event inserts.
+- Starter PostgreSQL schema at `packages/core/migrations/001_execution_control.sql`.
+- Unit tests and GitHub Actions CI, including high/critical dependency audit checks.
+- No AI API or paid model credits required for these features.
 
-## Start locally
+## Run the local console
 
 Requirements: Node.js 22.12+ and npm.
 
@@ -23,7 +26,9 @@ npm install
 npm run dev
 ```
 
-Open the local URL printed by Vite. Run the tests and build checks with:
+Open the local URL printed by Vite.
+
+Validate the current checkout:
 
 ```sh
 npm test
@@ -32,22 +37,32 @@ npm run build
 npm audit --audit-level=high
 ```
 
-## Server-side execution gate
+## Use the execution gate
 
-Import the gate from `@backstop/core/execution-gate` and register your application's actual server-side tools. Each tool definition fixes its action type and derives its target resource from validated input. The gate checks that request against policies and the application's resource authorization adapter before invoking the registered executor.
+The gate and adapter are package entry points:
 
-Read [the execution-gate integration guide](docs/execution-gate.md) and [policy scenario testing guide](docs/policy-testing.md) before integrating it.
+- `@backstop/core/execution-gate`
+- `@backstop/core/postgres-adapter`
+- `@backstop/core/scenarios`
 
-## Security boundary — read before use
+The PostgreSQL adapter accepts a compatible `pg.Pool`. Install the host app's database client with `npm install pg` and `npm install -D @types/pg`, configure `DATABASE_URL` as a server-side secret, then apply the schema with:
 
-The browser console is a local development interface. Its browser-held requests, rules, approvals, and events are not trusted production records, and it cannot protect an agent by itself.
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/core/migrations/001_execution_control.sql
+```
 
-The execution-gate module is an integration component, not a complete hosted security product. It depends on the host application's trusted authentication, durable policy and approval stores, object-level access control, audit storage, and correct tool adapters. Approval verification must bind the approval to the exact operation, request, organization, resource, and input digest, and must prevent replay. Tool adapters must use server-side credentials with least privilege. Do not use this repository as the sole security boundary for money, critical infrastructure, or sensitive production data; independent security review is required before production reliance.
+See [the execution-gate setup guide](docs/execution-gate.md), [the storage adapter contract](docs/storage-adapter-contract.md), and [policy testing](docs/policy-testing.md). Never expose database credentials in browser code or commit them to the repository.
 
-See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting and the current boundary.
+## Important production boundary
 
-## Project direction
+The local dashboard still stores its own examples/rules/approvals in the browser; it is not a production security boundary. The server-side gate and PostgreSQL adapter are reusable security components, **not a complete hosted SaaS**. They require the host application's real session/authentication layer, organization membership checks, reviewer authorization, object-level ACL, restricted database credentials, a deployment, and real integration tests.
 
-The long-term product goal is infrastructure developers can embed between an AI agent and any real tool it can invoke. A generic policy dashboard alone is not enough to differentiate this product. The next priorities are concrete adapters, persistent approval workflow, authenticated agent and organization identities, tamper-evident audit storage, idempotency/replay protection, adversarial integration tests, and customer validation.
+The database migration is a starter schema: it must be reviewed and applied to an actual PostgreSQL database. The adapter's callbacks must be connected to trusted application identity and ACL services. A policy decision does not prove the agent's resource identifier is honest; the registered tool's executor must perform the same operation against the same verified resource.
 
-BACKSTOP is early-stage software. It makes no claim that an agent can never bypass its controls or that any security certification has been achieved.
+Before protecting production systems, add and verify rate limiting, abuse monitoring, secret management/rotation, backup/recovery, idempotent side-effect semantics, audit retention/access controls, multi-tenant isolation tests, bypass/replay tests, observability, and an independent security review. The execution claim intentionally refuses automatic replay after uncertain outcomes; recovery needs a controlled operator workflow.
+
+## Product direction
+
+The long-term product goal is an enforcement and governance layer that teams can embed between any AI agent and the real tools it can invoke. Generic policy controls already exist in the market, so a viable business needs a sharper proven advantage, reliable integrations, measurable prevention of unsafe actions, and developer/customer adoption. No claim of complete agent security, certification, customer traction, or billion-dollar valuation is made.
+
+BACKSTOP is early-stage software under active development.
