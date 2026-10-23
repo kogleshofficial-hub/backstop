@@ -13,6 +13,48 @@ npm run check
 npm run build
 ```
 
+## PostgreSQL-backed storage
+
+A concrete PostgreSQL adapter and approval-review service are available:
+
+```sh
+npm install pg
+npm install -D @types/pg
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/core/migrations/001_execution_control.sql
+```
+
+Keep `DATABASE_URL` server-side in your deployment secrets. Never place it in frontend code or commit it to GitHub. The migration must be applied by a database owner/migration role; the application runtime should use a restricted database role.
+
+```ts
+import { Pool } from "pg";
+import { createExecutionGate } from "@backstop/core/execution-gate";
+import {
+  createPostgresApprovalService,
+  createPostgresExecutionGateDependencies,
+} from "@backstop/core/postgres-adapter";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const canReview = ({ organizationId, reviewerId }) =>
+  membershipStore.canReviewAIApprovals(organizationId, reviewerId);
+
+const storage = createPostgresExecutionGateDependencies(pool, {
+  authorizeResource: ({ agent, actionType, resource }) =>
+    applicationAcl.canInvoke(agent.id, agent.organizationId, actionType, resource),
+  authorizeReviewer: canReview,
+});
+
+const approvalService = createPostgresApprovalService(pool, {
+  authorizeReviewer: canReview,
+});
+
+const gate = createExecutionGate(serverRegisteredTools, storage);
+```
+
+The approval service exposes `listPending(organizationId, limit, offset)` and `review({ organizationId, requestId, reviewerId, outcome })`. Call these only from authenticated server routes. Derive the organization and reviewer from trusted session/membership data—not from caller-supplied JSON. An approval result returns one-time evidence; pass that evidence back to `gate.invoke` for the same request and payload. Review approval IDs are generated from the runtime's cryptographic UUID source.
+
+The adapter uses parameterized SQL and database transactions for one-time approval consumption and execution claims. It does not provision PostgreSQL, perform login/session authentication, implement your application's real ACL, or deploy a website. Those remain responsibilities of the host application. Test the real database, role permissions, approval routes, resource ACLs, migration and agent-tool adapter before any production use.
+
 ## The security flow
 
 1. Your existing server authenticates the caller and provides a trusted `AuthenticatedAgent` object. Never read its ID, organization, or permissions from the request body.
