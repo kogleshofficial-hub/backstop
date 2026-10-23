@@ -362,7 +362,7 @@ export function createExecutionGate(
             const logged = await appendAudit({
               requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
               toolName: tool.name, kind: "APPROVAL_REQUIRED", decision: evaluation.decision,
-              actionType: request.actionType, resource: request.resource, reason,
+              actionType: request.actionType, resource: request.resource, inputDigest: request.inputDigest, reason,
               policyVersion: evaluation.policyVersion,
             });
             return logged
@@ -394,7 +394,7 @@ export function createExecutionGate(
           const completedLog = await appendAudit({
             requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
             toolName: tool.name, kind: "EXECUTION_FAILED", decision: evaluation.decision,
-            actionType: request.actionType, resource: request.resource,
+            actionType: request.actionType, resource: request.resource, inputDigest: request.inputDigest,
             reason: "The registered tool execution failed.", policyVersion: evaluation.policyVersion,
           });
           return {
@@ -408,7 +408,7 @@ export function createExecutionGate(
         const completedLog = await appendAudit({
           requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
           toolName: tool.name, kind: "EXECUTION_SUCCEEDED", decision: evaluation.decision,
-          actionType: request.actionType, resource: request.resource,
+          actionType: request.actionType, resource: request.resource, inputDigest: request.inputDigest,
           reason: "The registered tool completed successfully.", policyVersion: evaluation.policyVersion,
         });
         return { status: "executed", request, evaluation, output, auditComplete: completedLog };
