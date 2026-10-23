@@ -64,7 +64,13 @@ class FakePool implements PgPool {
     this.queries.push({ sql, values });
     let rows: Row[] = [];
 
-    if (sql.includes("from backstop_policy_sets")) {
+    if (sql.includes("from backstop_policy_sets ps left join backstop_policy_rules")) {
+      if (this.policyVersion !== null) {
+        rows = this.policyRules.length
+          ? this.policyRules.map((rule) => ({ ...rule, policy_version: this.policyVersion }))
+          : [{ policy_version: this.policyVersion, rule_id: null }];
+      }
+    } else if (sql.includes("from backstop_policy_sets")) {
       rows = this.policyVersion === null ? [] : [{ policy_version: this.policyVersion }];
     } else if (sql.includes("from backstop_policy_rules")) {
       rows = this.policyRules;
