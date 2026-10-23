@@ -1,7 +1,7 @@
 {
   "name": "@backstop/core",
   "version": "0.1.0",
-  "description": "Deterministic AI action policies and server-side execution gate",
+  "description": "Deterministic AI action policies, execution gate, and PostgreSQL adapter",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -17,6 +17,10 @@
     "./execution-gate": {
       "types": "./dist/execution-gate.d.ts",
       "import": "./dist/execution-gate.js"
+    },
+    "./postgres-adapter": {
+      "types": "./dist/postgres-adapter.d.ts",
+      "import": "./dist/postgres-adapter.js"
     }
   },
   "files": [
