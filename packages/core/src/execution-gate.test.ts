@@ -67,6 +67,7 @@ describe("server execution gate", () => {
     expect(result.status).toBe("executed");
     if (result.status !== "executed") return;
     expect(result.output).toBe("docs/readme.md");
+    expect(result.request.inputDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(result.auditComplete).toBe(true);
     expect(authorizeResource).toHaveBeenCalledOnce();
     expect(h.execute).toHaveBeenCalledOnce();
@@ -76,7 +77,7 @@ describe("server execution gate", () => {
   it("does not execute the same request ID twice", async () => {
     const h = harness();
     const first = await h.gate.invoke<string>(invoke());
-    const second = await h.gate.invoke<string>(invoke());
+    const second = await h.gate.invoke<string>(invoke({ input: { resource: "docs/changed.md", message: "different payload" } }));
     expect(first.status).toBe("executed");
     expect(second.status).toBe("blocked");
     expect(h.execute).toHaveBeenCalledOnce();
@@ -109,6 +110,14 @@ describe("server execution gate", () => {
     expect(h.events[0].kind).toBe("APPROVAL_REQUIRED");
     expect(h.approvalRequests).toHaveLength(1);
     expect(h.approvalRequests[0].inputDigest).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("blocks an action when the durable approval queue cannot save the review request", async () => {
+    const tool = makeTool({ name: "mail.send", actionType: "send_external" });
+    const h = harness({ tool, recordApprovalRequest: async () => { throw new Error("database unavailable"); } });
+    const result = await h.gate.invoke(invoke({ toolName: "mail.send" }));
+    expect(result.status).toBe("error");
+    expect(h.execute).not.toHaveBeenCalled();
   });
 
   it("executes a reviewed action only after trusted approval verification", async () => {
