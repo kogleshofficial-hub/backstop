@@ -13,6 +13,7 @@ BACKSTOP is infrastructure for developers who want agent actions checked before 
 - Server-side gate with fixed server-registered tool/action mapping, authenticated principal contract, app-level resource authorization, canonical input snapshot and SHA-256 digest.
 - Durable approval request records and atomic approval consumption contract.
 - PostgreSQL adapter for versioned organization policies, pending approval queue, reviewer decisions, one-time execution claims, and audit event inserts.
+- Machine API credentials generated from cryptographically random tokens, stored as hashes, scoped to allowed actions, expiring by default, and revocable.
 - Starter PostgreSQL schema at `packages/core/migrations/001_execution_control.sql`.
 - Unit tests and GitHub Actions CI, including high/critical dependency audit checks.
 - No AI API or paid model credits required for these features.
@@ -44,6 +45,7 @@ The gate and adapter are package entry points:
 - `@backstop/core/execution-gate`
 - `@backstop/core/postgres-adapter`
 - `@backstop/core/scenarios`
+- `@backstop/core/postgres-adapter` — PostgreSQL storage, approval queue, and machine credential service
 
 The PostgreSQL adapter accepts a compatible `pg.Pool`. Install the host app's database client with `npm install pg` and `npm install -D @types/pg`, configure `DATABASE_URL` as a server-side secret, then apply the schema with:
 
@@ -51,7 +53,7 @@ The PostgreSQL adapter accepts a compatible `pg.Pool`. Install the host app's da
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/core/migrations/001_execution_control.sql
 ```
 
-See [the execution-gate setup guide](docs/execution-gate.md), [the storage adapter contract](docs/storage-adapter-contract.md), and [policy testing](docs/policy-testing.md). Never expose database credentials in browser code or commit them to the repository.
+See [the execution-gate setup guide](docs/execution-gate.md), [agent credentials](docs/agent-credentials.md), [the storage adapter contract](docs/storage-adapter-contract.md), and [policy testing](docs/policy-testing.md). Never expose database credentials in browser code or commit them to the repository.
 
 ## Important production boundary
 
