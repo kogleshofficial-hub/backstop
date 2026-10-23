@@ -154,21 +154,24 @@ export function createPostgresExecutionGateDependencies(
 
   return {
     async getRules(agent) {
-      const current = await pool.query<{ policy_version: unknown }>(
-        "SELECT policy_version FROM backstop_policy_sets WHERE organization_id = $1",
+      // One SQL statement gives policy version and rules one MVCC snapshot. A multi-query
+      // read could accidentally combine a just-changed version with stale rows.
+      const current = await pool.query<StoredRuleRow & { policy_version: unknown }>(
+        `SELECT ps.policy_version, r.rule_id, r.name, r.description, r.effect,
+                r.action_types, r.resource_patterns, r.enabled, r.priority
+         FROM backstop_policy_sets ps
+         LEFT JOIN backstop_policy_rules r
+           ON r.organization_id = ps.organization_id AND r.policy_version = ps.policy_version
+         WHERE ps.organization_id = $1
+         ORDER BY r.priority DESC NULLS LAST, r.rule_id ASC NULLS LAST`,
         [agent.organizationId],
       );
-      const rawVersion = current.rows[0]?.policy_version;
-      if (rawVersion === undefined) return { version: "baseline", rules: [] };
-      const version = nonEmptyString(rawVersion, "policy_version");
-      const stored = await pool.query<StoredRuleRow>(
-        `SELECT rule_id, name, description, effect, action_types, resource_patterns, enabled, priority
-         FROM backstop_policy_rules
-         WHERE organization_id = $1 AND policy_version = $2
-         ORDER BY priority DESC, rule_id ASC`,
-        [agent.organizationId, version],
-      );
-      return { version, rules: stored.rows.map(mapPolicyRule) };
+      if (current.rows.length === 0) return { version: "baseline", rules: [] };
+      const version = nonEmptyString(current.rows[0].policy_version, "policy_version");
+      const rules = current.rows
+        .filter((row) => row.rule_id !== null && row.rule_id !== undefined)
+        .map(mapPolicyRule);
+      return { version, rules };
     },
 
     authorizeResource: options.authorizeResource,
