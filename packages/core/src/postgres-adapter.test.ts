@@ -397,11 +397,19 @@ describe("PostgreSQL execution gate adapter", () => {
       expires_at: new Date(Date.now() + 60_000),
     };
     const service = createPostgresApprovalService(pool, { authorizeReviewer: async () => true });
-    const queue = await service.listPending(agent.organizationId);
+    const queue = await service.listPending({ organizationId: agent.organizationId, reviewerId: "reviewer-1" });
     expect(queue).toHaveLength(1);
     expect(queue[0].requestId).toBe(request.id);
     expect(queue[0].inputDigest).toBe(digest);
     expect(pool.queries[0].sql).toContain("where organization_id = $1");
+  });
+
+  it("refuses to disclose the approval queue to an unauthorized reviewer", async () => {
+    const pool = new FakePool();
+    const service = createPostgresApprovalService(pool, { authorizeReviewer: async () => false });
+    await expect(service.listPending({ organizationId: agent.organizationId, reviewerId: "untrusted" }))
+      .rejects.toThrow("This reviewer is not permitted to view approvals");
+    expect(pool.queries).toHaveLength(0);
   });
 
   it("approves a pending request transactionally and issues one-time evidence", async () => {
