@@ -41,7 +41,7 @@ function harness(options: {
   const claims = new Set<string>();
   const execute = options.tool?.execute ?? vi.fn(async (input: Input) => input.resource);
   const gate = createExecutionGate([options.tool ?? makeTool({ execute })], {
-    getRules: async () => options.rules ?? [],
+    getRules: async () => ({ version: "test-policy-v1", rules: options.rules ?? [] }),
     authorizeResource: options.authorizeResource ?? (async () => true),
     verifyAndConsumeApproval: options.verifyAndConsumeApproval ?? (async () => false),
     recordApprovalRequest: options.recordApprovalRequest ?? (async ({ request }) => { approvalRequests.push(request); }),
