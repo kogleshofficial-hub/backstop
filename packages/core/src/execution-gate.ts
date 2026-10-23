@@ -71,6 +71,8 @@ export interface GateAuditEvent {
   kind:
     | "BLOCKED"
     | "APPROVAL_REQUIRED"
+    | "APPROVAL_APPROVED"
+    | "APPROVAL_REJECTED"
     | "EXECUTION_AUTHORIZED"
     | "EXECUTION_SUCCEEDED"
     | "EXECUTION_FAILED"
