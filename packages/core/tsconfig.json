@@ -16,6 +16,7 @@
   "include": [
     "src/index.ts",
     "src/scenarios.ts",
-    "src/execution-gate.ts"
+    "src/execution-gate.ts",
+    "src/postgres-adapter.ts"
   ]
 }
