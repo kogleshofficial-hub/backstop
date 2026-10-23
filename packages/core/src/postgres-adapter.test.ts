@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createPostgresAgentCredentialService,
   createPostgresExecutionGateDependencies,
+  createPostgresPolicyService,
   type PgConnection,
   type PgPool,
   type PgQueryResult,
@@ -41,6 +42,7 @@ const approvalRow = (overrides: Row = {}): Row => ({
 
 class FakePool implements PgPool {
   policyVersion: string | null = "policy-v4";
+  policySetWritten = false;
   credentials: Row[] = [];
   policyRules: Row[] = [{
     rule_id: "send-review",
@@ -66,10 +68,23 @@ class FakePool implements PgPool {
 
     if (sql.includes("from backstop_policy_sets ps left join backstop_policy_rules")) {
       if (this.policyVersion !== null) {
-        rows = this.policyRules.length
-          ? this.policyRules.map((rule) => ({ ...rule, policy_version: this.policyVersion }))
+        const versionedRules = this.policyRules.filter((rule) => rule.policy_version === this.policyVersion);
+        const selectedRules = versionedRules.length
+          ? versionedRules
+          : this.policySetWritten ? [] : this.policyRules.filter((rule) => rule.policy_version === undefined);
+        rows = selectedRules.length
+          ? selectedRules.map((rule) => ({ ...rule, policy_version: this.policyVersion }))
           : [{ policy_version: this.policyVersion, rule_id: null }];
       }
+    } else if (sql.startsWith("insert into backstop_policy_sets")) {
+      this.policyVersion = String(values[1]);
+      this.policySetWritten = true;
+    } else if (sql.startsWith("insert into backstop_policy_rules")) {
+      this.policyRules.push({
+        organization_id: values[0], policy_version: values[1], rule_id: values[2],
+        name: values[3], description: values[4], effect: values[5], action_types: values[6],
+        resource_patterns: values[7], enabled: values[8], priority: values[9],
+      });
     } else if (sql.includes("from backstop_policy_sets")) {
       rows = this.policyVersion === null ? [] : [{ policy_version: this.policyVersion }];
     } else if (sql.includes("from backstop_policy_rules")) {
@@ -236,6 +251,68 @@ describe("PostgreSQL execution gate adapter", () => {
       organizationId: agent.organizationId, actorId: "untrusted", agentId: "agent",
       allowedActions: ["read_resource"],
     })).rejects.toThrow("Credential management is not authorized");
+  });
+
+  it("publishes a versioned organization policy in one transaction and loads that revision", async () => {
+    const pool = new FakePool();
+    const service = createPostgresPolicyService(pool, {
+      authorizePolicyManagement: async ({ organizationId, actorId }) =>
+        organizationId === agent.organizationId && actorId === "admin-1",
+    });
+    const published = await service.publish({
+      organizationId: agent.organizationId,
+      actorId: "admin-1",
+      rules: [{
+        id: "block-private",
+        name: "Block private exports",
+        description: "Private exports must never leave the workspace.",
+        effect: "BLOCK",
+        actionTypes: ["send_external"],
+        resources: ["exports/private/**"],
+        enabled: true,
+        priority: 400,
+      }],
+    });
+    expect(published.version).toMatch(/^org_[a-f0-9]{32}$/);
+    expect(pool.queries.map((query) => query.sql).filter((sql) => ["begin", "commit"].includes(sql))).toEqual(["begin", "commit"]);
+    const current = await service.loadCurrent(agent.organizationId);
+    expect(current.version).toBe(published.version);
+    expect(current.rules).toHaveLength(1);
+    expect(current.rules[0].effect).toBe("BLOCK");
+    expect(current.rules[0].resources).toEqual(["exports/private/**"]);
+  });
+
+  it("refuses policies that attempt to create custom ALLOW permissions", async () => {
+    const pool = new FakePool();
+    const service = createPostgresPolicyService(pool, {
+      authorizePolicyManagement: async () => true,
+    });
+    await expect(service.publish({
+      organizationId: agent.organizationId,
+      actorId: "admin-1",
+      rules: [{
+        id: "allow-everything",
+        name: "Allow everything",
+        description: "Invalid custom permission grant.",
+        effect: "ALLOW",
+        actionTypes: ["delete_resource"],
+        resources: ["*"],
+        enabled: true,
+        priority: 1,
+      }],
+    })).rejects.toThrow("Custom organization policies cannot grant ALLOW permissions.");
+    expect(pool.policySetWritten).toBe(false);
+  });
+
+  it("refuses policy publication without organization-admin authorization", async () => {
+    const service = createPostgresPolicyService(new FakePool(), {
+      authorizePolicyManagement: async () => false,
+    });
+    await expect(service.publish({
+      organizationId: agent.organizationId,
+      actorId: "untrusted",
+      rules: [],
+    })).rejects.toThrow("Policy management is not authorized");
   });
 
   it("loads a versioned restrictive policy snapshot", async () => {
