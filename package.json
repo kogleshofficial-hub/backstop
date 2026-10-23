@@ -2,14 +2,17 @@
   "name": "backstop",
   "private": true,
   "version": "0.1.0",
-  "description": "Deterministic policy enforcement for AI agent actions",
-  "workspaces": ["packages/*"],
+  "description": "AI agent action policy, execution gating, and governance infrastructure",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "npm run build --workspace=@backstop/core && tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test": "vitest run",
-    "check": "npm run build --workspace=@backstop/core && tsc --noEmit"
+    "check": "npm run build --workspace=@backstop/core && tsc --noEmit",
+    "predev": "npm run build --workspace=@backstop/core"
   },
   "dependencies": {
     "@backstop/core": "0.1.0",
