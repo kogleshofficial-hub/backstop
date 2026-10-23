@@ -28,7 +28,7 @@ npm run build
 - `describe` must map the actual tool operation and target to a truthful resource identifier and safe summary; never put tokens, secrets, or personal data in audit text.
 - `authorizeResource` must perform the application's actual object-level and organization-level authorization.
 - `getRules` must read trusted server-owned policy configuration; never accept arbitrary custom rules from a browser.
-- `verifyApproval` must check a persisted, authenticated, unexpired approval bound to the same organization, request, operation, resource, input digest, and reviewer permissions. It should enforce single use/replay protection. The gate checks the request ID match, but your verifier must validate the other binding.
+- `verifyAndConsumeApproval` must check a persisted, authenticated, unexpired approval bound to the same organization, request, operation, resource, input digest, and reviewer permissions. It should enforce single use/replay protection. The gate checks the request ID match, but your verifier must validate the other binding.
 - `appendAudit` must write to a server-controlled durable store. Browser local storage is not suitable.
 
 Example tool registration:
@@ -58,7 +58,7 @@ const gate = createExecutionGate([{
   getRules: (agent) => policyStore.loadRules(agent.organizationId),
   authorizeResource: ({ agent, resource }) =>
     documentService.canRead(agent.id, resource),
-  verifyApproval: (verification) => approvalStore.verifyForExactRequest(verification),
+  verifyAndConsumeApproval: (verification) => approvalStore.verifyAndConsumeOnceForExactRequest(verification),
   appendAudit: (event) => auditStore.append(event),
 });
 
