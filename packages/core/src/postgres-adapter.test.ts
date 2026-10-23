@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   createPostgresAgentCredentialService,
+  createPostgresApprovalService,
   createPostgresExecutionGateDependencies,
   createPostgresPolicyService,
   type PgConnection,
@@ -136,6 +137,12 @@ class FakePool implements PgPool {
         };
         rows = [{ request_id: values[1] }];
       }
+    } else if (sql.includes("from backstop_approval_requests") && sql.includes("order by created_at asc")) {
+      if (this.approval && this.approval.organization_id === values[0]
+        && this.approval.status === "pending"
+        && new Date(String(this.approval.expires_at)).getTime() > Date.now()) {
+        rows = [{ ...this.approval, created_at: new Date() }];
+      }
     } else if (sql.includes("from backstop_approval_requests")) {
       const [organizationId, requestId, approvalId] = values;
       if (this.approval
@@ -152,7 +159,13 @@ class FakePool implements PgPool {
         rows = [this.approval];
       }
     } else if (sql.startsWith("update backstop_approval_requests")) {
-      if (this.approval && this.approval.organization_id === values[0]
+      if (sql.includes("set status = $3")) {
+        if (this.approval && this.approval.organization_id === values[0]
+          && this.approval.request_id === values[1] && this.approval.status === "pending") {
+          this.approval = { ...this.approval, status: values[2], reviewer_id: values[3], approval_id: values[4] };
+          rows = [{ request_id: values[1] }];
+        }
+      } else if (this.approval && this.approval.organization_id === values[0]
         && this.approval.request_id === values[1] && this.approval.approval_id === values[2]
         && this.approval.status === "approved") {
         this.approval = { ...this.approval, status: "consumed" };
@@ -356,6 +369,64 @@ describe("PostgreSQL execution gate adapter", () => {
       evaluation,
     })).rejects.toThrow("A conflicting, expired, or already-used approval request ID exists.");
     expect(pool.queries.filter((query) => query.sql.startsWith("insert into backstop_approval_requests")).length).toBe(2);
+  });
+
+  it("lists only current pending approvals for the requested organization", async () => {
+    const pool = new FakePool();
+    pool.approval = {
+      organization_id: agent.organizationId, request_id: request.id, agent_id: agent.id,
+      tool_name: request.toolName, action_type: request.actionType, resource: request.resource,
+      summary: request.summary, input_digest: digest, policy_version: request.policyVersion,
+      status: "pending", reviewer_id: null, approval_id: null,
+      expires_at: new Date(Date.now() + 60_000),
+    };
+    const service = createPostgresApprovalService(pool, { authorizeReviewer: async () => true });
+    const queue = await service.listPending(agent.organizationId);
+    expect(queue).toHaveLength(1);
+    expect(queue[0].requestId).toBe(request.id);
+    expect(queue[0].inputDigest).toBe(digest);
+    expect(pool.queries[0].sql).toContain("where organization_id = $1");
+  });
+
+  it("approves a pending request transactionally and issues one-time evidence", async () => {
+    const pool = new FakePool();
+    pool.approval = {
+      organization_id: agent.organizationId, request_id: request.id, agent_id: agent.id,
+      tool_name: request.toolName, action_type: request.actionType, resource: request.resource,
+      summary: request.summary, input_digest: digest, policy_version: request.policyVersion,
+      status: "pending", reviewer_id: null, approval_id: null,
+      expires_at: new Date(Date.now() + 60_000),
+    };
+    const service = createPostgresApprovalService(pool, {
+      authorizeReviewer: async ({ organizationId, reviewerId }) =>
+        organizationId === agent.organizationId && reviewerId === "reviewer-1",
+    });
+    const result = await service.review({
+      organizationId: agent.organizationId, requestId: request.id, reviewerId: "reviewer-1", outcome: "approve",
+    });
+    expect(result.status).toBe("approved");
+    expect(result.approval?.requestId).toBe(request.id);
+    expect(result.approval?.approvalId).toMatch(/^bsa_[a-f0-9]{32}$/);
+    expect(pool.approval?.status).toBe("approved");
+    expect(pool.queries.map((query) => query.sql).filter((sql) => ["begin", "commit"].includes(sql))).toEqual(["begin", "commit"]);
+    expect(pool.queries.some((query) => query.sql.includes("insert into backstop_audit_events"))).toBe(true);
+  });
+
+  it("refuses review when the reviewer is not authorized", async () => {
+    const pool = new FakePool();
+    pool.approval = {
+      organization_id: agent.organizationId, request_id: request.id, agent_id: agent.id,
+      tool_name: request.toolName, action_type: request.actionType, resource: request.resource,
+      summary: request.summary, input_digest: digest, policy_version: request.policyVersion,
+      status: "pending", reviewer_id: null, approval_id: null,
+      expires_at: new Date(Date.now() + 60_000),
+    };
+    const service = createPostgresApprovalService(pool, { authorizeReviewer: async () => false });
+    await expect(service.review({
+      organizationId: agent.organizationId, requestId: request.id, reviewerId: "no-access", outcome: "approve",
+    })).rejects.toThrow("This reviewer is not permitted");
+    expect(pool.approval?.status).toBe("pending");
+    expect(pool.queries.some((query) => query.sql === "rollback")).toBe(true);
   });
 
   it("atomically consumes an approval bound to the exact request and input digest", async () => {
