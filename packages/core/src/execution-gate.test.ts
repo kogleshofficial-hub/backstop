@@ -32,17 +32,25 @@ function harness(options: {
   rules?: readonly PolicyRule[];
   authorizeResource?: (args: { agent: AuthenticatedAgent; actionType: "read_resource" | "write_resource" | "delete_resource" | "send_external"; resource: string }) => Promise<boolean>;
   verifyAndConsumeApproval?: (args: { agent: AuthenticatedAgent; request: GuardedActionRequest; inputDigest: string; approval: { requestId: string; approvalId: string } }) => Promise<boolean>;
+  claimExecution?: (args: { agent: AuthenticatedAgent; request: GuardedActionRequest; toolName: string }) => Promise<boolean>;
   appendAudit?: (event: GateAuditEvent) => Promise<void>;
 } = {}) {
   const events: GateAuditEvent[] = [];
+  const claims = new Set<string>();
   const execute = options.tool?.execute ?? vi.fn(async (input: Input) => input.resource);
   const gate = createExecutionGate([options.tool ?? makeTool({ execute })], {
     getRules: async () => options.rules ?? [],
     authorizeResource: options.authorizeResource ?? (async () => true),
     verifyAndConsumeApproval: options.verifyAndConsumeApproval ?? (async () => false),
+    claimExecution: options.claimExecution ?? (async ({ agent: principal, request }) => {
+      const key = `${principal.organizationId}:${request.id}`;
+      if (claims.has(key)) return false;
+      claims.add(key);
+      return true;
+    }),
     appendAudit: options.appendAudit ?? (async (event) => { events.push(event); }),
   });
-  return { gate, events, execute };
+  return { gate, events, execute, claims };
 }
 const invoke = (overrides: Partial<{ requestId: string; agent: AuthenticatedAgent; toolName: string; input: unknown; approval: { requestId: string; approvalId: string } }> = {}) => ({
   requestId: "request-1", agent, toolName: "documents.read", input: { resource: "docs/readme.md" }, ...overrides,
@@ -60,6 +68,24 @@ describe("server execution gate", () => {
     expect(authorizeResource).toHaveBeenCalledOnce();
     expect(h.execute).toHaveBeenCalledOnce();
     expect(h.events.map((event) => event.kind)).toEqual(["EXECUTION_AUTHORIZED", "EXECUTION_SUCCEEDED"]);
+  });
+
+  it("does not execute the same request ID twice", async () => {
+    const h = harness();
+    const first = await h.gate.invoke<string>(invoke());
+    const second = await h.gate.invoke<string>(invoke());
+    expect(first.status).toBe("executed");
+    expect(second.status).toBe("blocked");
+    expect(h.execute).toHaveBeenCalledOnce();
+    expect(h.events.some((event) => event.kind === "BLOCKED" && event.reason.includes("already claimed"))).toBe(true);
+  });
+
+  it("fails closed when the durable execution-claim store is unavailable", async () => {
+    const execute = vi.fn(async (input: Input) => input.resource);
+    const h = harness({ tool: makeTool({ execute }), claimExecution: async () => { throw new Error("storage unavailable"); } });
+    const result = await h.gate.invoke(invoke());
+    expect(result.status).toBe("error");
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it("never executes a baseline-blocked deletion even when the principal has the action", async () => {
@@ -137,6 +163,7 @@ describe("server execution gate", () => {
       getRules: async () => { throw new Error("storage unavailable"); },
       authorizeResource: async () => true,
       verifyAndConsumeApproval: async () => false,
+      claimExecution: async () => true,
       appendAudit: async (event) => { h.events.push(event); },
     });
     const result = await getRulesGate.invoke(invoke());
