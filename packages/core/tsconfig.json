@@ -13,5 +13,5 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["src/index.ts"]
+  "include": ["src/index.ts", "src/scenarios.ts"]
 }
