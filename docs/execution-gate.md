@@ -51,7 +51,7 @@ const approvalService = createPostgresApprovalService(pool, {
 const gate = createExecutionGate(serverRegisteredTools, storage);
 ```
 
-The approval service exposes `listPending(organizationId, limit, offset)` and `review({ organizationId, requestId, reviewerId, outcome })`. Call these only from authenticated server routes. Derive the organization and reviewer from trusted session/membership data—not from caller-supplied JSON. An approval result returns one-time evidence; pass that evidence back to `gate.invoke` for the same request and payload. Review approval IDs are generated from the runtime's cryptographic UUID source.
+The approval service exposes `listPending({ organizationId, reviewerId, limit, offset })` and `review({ organizationId, requestId, reviewerId, outcome })`. Both methods enforce reviewer authorization through the supplied callback. Call them only from authenticated server routes and derive the organization and reviewer from trusted session/membership data—not from caller-supplied JSON. An approval result returns one-time evidence; pass that evidence back to `gate.invoke` for the same request and payload. Review approval IDs are generated from the runtime's cryptographic UUID source.
 
 The same module also exports `createPostgresPolicyService`, which validates restrictive rules, publishes an immutable versioned revision in a single transaction, retains previous revisions, and records a `POLICY_PUBLISHED` audit event. Its `loadCurrent(organizationId)` method returns the active version and rules. Use the organization policy-management authorization callback on every publish call.
 
