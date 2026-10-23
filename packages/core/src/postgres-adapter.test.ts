@@ -95,7 +95,7 @@ class FakePool implements PgPool {
         credential_id: values[0], organization_id: values[1], agent_id: values[2],
         key_prefix: values[3], token_hash: values[4], allowed_actions: values[5],
         status: "active", created_by: values[6], created_at: new Date(),
-        last_used_at: null, expires_at: values[7], revoked_at: null,
+        last_used_at: null, expires_at: new Date(Date.now() + Number(values[7]) * 1000), revoked_at: null,
       };
       this.credentials.push(row);
       rows = [row];
@@ -235,6 +235,22 @@ describe("PostgreSQL execution gate adapter", () => {
     });
     expect(await service.authenticate("invalid-token")).toBeNull();
     expect((await service.list({ organizationId: agent.organizationId, actorId: "admin-1" })).length).toBe(1);
+  });
+
+  it("rejects a machine credential after its database expiry", async () => {
+    const pool = new FakePool();
+    const service = createPostgresAgentCredentialService(pool, {
+      authorizeCredentialManagement: async () => true,
+    });
+    const created = await service.create({
+      organizationId: agent.organizationId,
+      actorId: "admin-1",
+      agentId: "agent-workflow",
+      allowedActions: ["read_resource"],
+      ttlSeconds: 3600,
+    });
+    pool.credentials[0].expires_at = new Date(Date.now() - 1000);
+    expect(await service.authenticate(created.secret)).toBeNull();
   });
 
   it("revokes a credential and rejects it on the next authentication", async () => {
