@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { createExecutionGate, type AuthenticatedAgent, type GateAuditEvent, type GuardedTool } from "./execution-gate.js";
-import type { ActionRequest, PolicyRule } from "./index.js";
+import { createExecutionGate, type AuthenticatedAgent, type GateAuditEvent, type GuardedActionRequest, type GuardedTool } from "./execution-gate.js";
+import type { PolicyRule } from "./index.js";
 
 interface Input { resource: string; message?: string }
 const agent: AuthenticatedAgent = {
@@ -31,7 +31,7 @@ function harness(options: {
   tool?: GuardedTool<Input, string>;
   rules?: readonly PolicyRule[];
   authorizeResource?: (args: { agent: AuthenticatedAgent; actionType: "read_resource" | "write_resource" | "delete_resource" | "send_external"; resource: string }) => Promise<boolean>;
-  verifyApproval?: (args: { agent: AuthenticatedAgent; request: ActionRequest; approval: { requestId: string; approvalId: string } }) => Promise<boolean>;
+  verifyAndConsumeApproval?: (args: { agent: AuthenticatedAgent; request: GuardedActionRequest; inputDigest: string; approval: { requestId: string; approvalId: string } }) => Promise<boolean>;
   appendAudit?: (event: GateAuditEvent) => Promise<void>;
 } = {}) {
   const events: GateAuditEvent[] = [];
@@ -39,7 +39,7 @@ function harness(options: {
   const gate = createExecutionGate([options.tool ?? makeTool({ execute })], {
     getRules: async () => options.rules ?? [],
     authorizeResource: options.authorizeResource ?? (async () => true),
-    verifyApproval: options.verifyApproval ?? (async () => false),
+    verifyAndConsumeApproval: options.verifyAndConsumeApproval ?? (async () => false),
     appendAudit: options.appendAudit ?? (async (event) => { events.push(event); }),
   });
   return { gate, events, execute };
@@ -82,27 +82,27 @@ describe("server execution gate", () => {
 
   it("executes a reviewed action only after trusted approval verification", async () => {
     const tool = makeTool({ name: "mail.send", actionType: "send_external" });
-    const verifyApproval = vi.fn(async ({ request, approval }: { request: ActionRequest; approval: { requestId: string; approvalId: string } }) => request.id === approval.requestId && approval.approvalId === "approval-1");
-    const h = harness({ tool, verifyApproval });
+    const verifyAndConsumeApproval = vi.fn(async ({ request, inputDigest, approval }: { request: GuardedActionRequest; inputDigest: string; approval: { requestId: string; approvalId: string } }) => request.id === approval.requestId && request.inputDigest === inputDigest && /^[a-f0-9]{64}$/.test(inputDigest) && approval.approvalId === "approval-1");
+    const h = harness({ tool, verifyAndConsumeApproval });
     const result = await h.gate.invoke<string>(invoke({
       toolName: "mail.send",
       approval: { requestId: "request-1", approvalId: "approval-1" },
     }));
     expect(result.status).toBe("executed");
-    expect(verifyApproval).toHaveBeenCalledOnce();
+    expect(verifyAndConsumeApproval).toHaveBeenCalledOnce();
     expect(h.execute).toHaveBeenCalledOnce();
   });
 
   it("rejects an approval for a different request ID", async () => {
     const tool = makeTool({ name: "mail.send", actionType: "send_external" });
-    const verifyApproval = vi.fn(async () => true);
-    const h = harness({ tool, verifyApproval });
+    const verifyAndConsumeApproval = vi.fn(async () => true);
+    const h = harness({ tool, verifyAndConsumeApproval });
     const result = await h.gate.invoke(invoke({
       toolName: "mail.send",
       approval: { requestId: "another-request", approvalId: "approval-1" },
     }));
     expect(result.status).toBe("approval_required");
-    expect(verifyApproval).not.toHaveBeenCalled();
+    expect(verifyAndConsumeApproval).not.toHaveBeenCalled();
     expect(h.execute).not.toHaveBeenCalled();
   });
 
@@ -136,7 +136,7 @@ describe("server execution gate", () => {
     const getRulesGate = createExecutionGate([makeTool({ execute })], {
       getRules: async () => { throw new Error("storage unavailable"); },
       authorizeResource: async () => true,
-      verifyApproval: async () => false,
+      verifyAndConsumeApproval: async () => false,
       appendAudit: async (event) => { h.events.push(event); },
     });
     const result = await getRulesGate.invoke(invoke());
