@@ -58,7 +58,7 @@ const gate = createExecutionGate([{
     return await documentService.readForAgent(agent.id, input.documentId);
   },
 }], {
-  getRules: (agent) => policyStore.loadRules(agent.organizationId),
+  getRules: (agent) => policyStore.loadCurrent(agent.organizationId),
   authorizeResource: ({ agent, resource }) =>
     documentService.canRead(agent.id, resource),
   recordApprovalRequest: (entry) => approvalStore.insertPendingOnce(entry),
