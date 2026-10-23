@@ -473,3 +473,320 @@ export function createPostgresApprovalService(
     },
   };
 }
+
+
+export interface AgentCredentialMetadata {
+  credentialId: string;
+  organizationId: string;
+  agentId: string;
+  keyPrefix: string;
+  allowedActions: ActionType[];
+  status: "active" | "revoked";
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string;
+}
+
+export interface CreatedAgentCredential extends AgentCredentialMetadata {
+  /** Returned only by create(). Do not log it or send it back to the client after creation. */
+  secret: string;
+}
+
+export interface AuthenticatedCredential {
+  credentialId: string;
+  agent: AuthenticatedAgent;
+}
+
+export interface AgentCredentialServiceOptions {
+  /** Check organization-admin/credential-manager rights using trusted session identity. */
+  authorizeCredentialManagement(input: { organizationId: string; actorId: string }): Promise<boolean>;
+  /** Default 90 days. Valid range: one hour to one year. */
+  defaultTtlSeconds?: number;
+}
+
+interface StoredCredentialRow extends Record<string, unknown> {
+  credential_id: unknown;
+  organization_id: unknown;
+  agent_id: unknown;
+  key_prefix: unknown;
+  allowed_actions: unknown;
+  status: unknown;
+  created_at: unknown;
+  last_used_at: unknown;
+  expires_at: unknown;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  if (!globalThis.crypto?.subtle) throw new Error("Web Crypto is required for credential hashing.");
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function secureSecretPart(): string {
+  if (typeof globalThis.crypto?.getRandomValues !== "function") {
+    throw new Error("A cryptographically secure random source is required for API keys.");
+  }
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let result = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i];
+    const hasB = i + 1 < bytes.length;
+    const hasC = i + 2 < bytes.length;
+    const b = hasB ? bytes[i + 1] : 0;
+    const c = hasC ? bytes[i + 2] : 0;
+    result += alphabet[(a >> 2) & 63];
+    result += alphabet[((a & 3) << 4) | (b >> 4)];
+    if (hasB) result += alphabet[((b & 15) << 2) | (c >> 6)];
+    if (hasC) result += alphabet[c & 63];
+  }
+  return result;
+}
+
+function mapCredentialMetadata(row: StoredCredentialRow): AgentCredentialMetadata {
+  const actions = stringArray(row.allowed_actions, "allowed_actions");
+  if (!actions.every(isActionType)) throw new Error("Credential has an invalid action scope.");
+  if (row.status !== "active" && row.status !== "revoked") {
+    throw new Error("Credential has an invalid status.");
+  }
+  return {
+    credentialId: nonEmptyString(row.credential_id, "credential_id"),
+    organizationId: nonEmptyString(row.organization_id, "organization_id"),
+    agentId: nonEmptyString(row.agent_id, "agent_id"),
+    keyPrefix: nonEmptyString(row.key_prefix, "key_prefix"),
+    allowedActions: actions as ActionType[],
+    status: row.status,
+    createdAt: toIso(row.created_at, "created_at"),
+    lastUsedAt: row.last_used_at === null || row.last_used_at === undefined
+      ? null : toIso(row.last_used_at, "last_used_at"),
+    expiresAt: toIso(row.expires_at, "expires_at"),
+  };
+}
+
+/**
+ * API-key identity for server-to-server agent traffic.
+ * Secrets are high-entropy, shown once and persisted only as SHA-256 digests.
+ * The caller must protect every management method with its own authenticated server route.
+ */
+export function createPostgresAgentCredentialService(
+  pool: PgPool,
+  options: AgentCredentialServiceOptions,
+) {
+  if (!pool || typeof pool.query !== "function" || typeof pool.connect !== "function") {
+    throw new Error("A compatible PostgreSQL pool is required.");
+  }
+  if (typeof options?.authorizeCredentialManagement !== "function") {
+    throw new Error("A credential-management authorization callback is required.");
+  }
+  const defaultTtl = options.defaultTtlSeconds ?? 7776000;
+  if (!Number.isInteger(defaultTtl) || defaultTtl < 3600 || defaultTtl > 31536000) {
+    throw new Error("defaultTtlSeconds must be between one hour and one year.");
+  }
+
+  async function assertManager(organizationId: string, actorId: string): Promise<void> {
+    if (!organizationId.trim() || !actorId.trim()
+      || !await options.authorizeCredentialManagement({ organizationId, actorId })) {
+      throw new Error("Credential management is not authorized for this organization.");
+    }
+  }
+
+  async function writeCredentialAudit(
+    client: PgConnection,
+    input: {
+      organizationId: string;
+      credentialId: string;
+      actorId: string;
+      agentId: string;
+      keyPrefix: string;
+      action: "CREDENTIAL_CREATED" | "CREDENTIAL_REVOKED";
+    },
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO backstop_audit_events
+         (occurred_at, organization_id, request_id, agent_id, tool_name, kind, decision,
+          policy_version, action_type, resource, input_digest, reason)
+       VALUES (now(),$1,$2,$3,$4,$5,'ALLOW','credential-service-v1',NULL,$6,NULL,$7)`,
+      [
+        input.organizationId,
+        `credential:${input.credentialId}`,
+        input.actorId,
+        "credential.management",
+        input.action,
+        input.keyPrefix,
+        input.action === "CREDENTIAL_CREATED"
+          ? "An organization-scoped machine credential was created; the secret was disclosed once."
+          : "An organization-scoped machine credential was revoked.",
+      ],
+    );
+  }
+
+  return {
+    async create(input: {
+      organizationId: string;
+      actorId: string;
+      agentId: string;
+      allowedActions: readonly ActionType[];
+      ttlSeconds?: number;
+    }): Promise<CreatedAgentCredential> {
+      if (!input || typeof input.organizationId !== "string" || typeof input.actorId !== "string"
+        || typeof input.agentId !== "string" || !input.organizationId.trim()
+        || !input.actorId.trim() || !input.agentId.trim()) {
+        throw new Error("Organization, actor, and agent IDs are required.");
+      }
+      await assertManager(input.organizationId, input.actorId);
+      if (!Array.isArray(input.allowedActions) || input.allowedActions.length === 0
+        || !input.allowedActions.every(isActionType)) {
+        throw new Error("At least one known action scope is required.");
+      }
+      const actions = [...new Set(input.allowedActions)];
+      const ttlSeconds = input.ttlSeconds ?? defaultTtl;
+      if (!Number.isInteger(ttlSeconds) || ttlSeconds < 3600 || ttlSeconds > 31536000) {
+        throw new Error("Credential TTL must be between one hour and one year.");
+      }
+
+      const credentialId = globalThis.crypto?.randomUUID?.();
+      if (!credentialId) throw new Error("A cryptographically secure UUID source is required.");
+      const secret = `bsk_live_${secureSecretPart()}`;
+      const keyPrefix = `bsk_live_${secret.slice("bsk_live_".length, "bsk_live_".length + 8)}`;
+      const tokenHash = await sha256Hex(secret);
+      const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+      const client = await pool.connect();
+      let begun = false;
+      try {
+        await client.query("BEGIN");
+        begun = true;
+        const inserted = await client.query<StoredCredentialRow>(
+          `INSERT INTO backstop_agent_credentials
+             (credential_id, organization_id, agent_id, key_prefix, token_hash, allowed_actions,
+              status, created_by, expires_at)
+           VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8)
+           RETURNING credential_id, organization_id, agent_id, key_prefix, allowed_actions,
+                     status, created_at, last_used_at, expires_at`,
+          [credentialId, input.organizationId, input.agentId, keyPrefix, tokenHash, actions, input.actorId, expiresAt],
+        );
+        const row = inserted.rows[0];
+        if (!row) throw new Error("The database did not create the credential.");
+        await writeCredentialAudit(client, {
+          organizationId: input.organizationId,
+          credentialId,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          keyPrefix,
+          action: "CREDENTIAL_CREATED",
+        });
+        await client.query("COMMIT");
+        begun = false;
+        return { ...mapCredentialMetadata(row), secret };
+      } catch (error) {
+        if (begun) {
+          try { await client.query("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+        }
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async authenticate(secret: string): Promise<AuthenticatedCredential | null> {
+      if (typeof secret !== "string" || !/^bsk_live_[A-Za-z0-9_-]{43}$/.test(secret)) return null;
+      const tokenHash = await sha256Hex(secret);
+      const selected = await pool.query<StoredCredentialRow>(
+        `SELECT credential_id, organization_id, agent_id, key_prefix, allowed_actions,
+                status, created_at, last_used_at, expires_at
+         FROM backstop_agent_credentials
+         WHERE token_hash = $1 AND status = 'active' AND expires_at > now()`,
+        [tokenHash],
+      );
+      const row = selected.rows[0];
+      if (!row) return null;
+      const metadata = mapCredentialMetadata(row);
+      const touched = await pool.query<{ credential_id: unknown }>(
+        `UPDATE backstop_agent_credentials
+         SET last_used_at = now()
+         WHERE credential_id = $1 AND status = 'active' AND expires_at > now()
+         RETURNING credential_id`,
+        [metadata.credentialId],
+      );
+      if (touched.rows.length !== 1) return null;
+      return {
+        credentialId: metadata.credentialId,
+        agent: {
+          id: metadata.agentId,
+          organizationId: metadata.organizationId,
+          allowedActions: metadata.allowedActions,
+        },
+      };
+    },
+
+    async list(input: { organizationId: string; actorId: string }): Promise<AgentCredentialMetadata[]> {
+      if (!input || typeof input.organizationId !== "string" || typeof input.actorId !== "string") {
+        throw new Error("Organization and actor are required.");
+      }
+      await assertManager(input.organizationId, input.actorId);
+      const selected = await pool.query<StoredCredentialRow>(
+        `SELECT credential_id, organization_id, agent_id, key_prefix, allowed_actions,
+                status, created_at, last_used_at, expires_at
+         FROM backstop_agent_credentials
+         WHERE organization_id = $1
+         ORDER BY created_at DESC, credential_id ASC`,
+        [input.organizationId],
+      );
+      return selected.rows.map(mapCredentialMetadata);
+    },
+
+    async revoke(input: { organizationId: string; actorId: string; credentialId: string }): Promise<boolean> {
+      if (!input || typeof input.organizationId !== "string" || typeof input.actorId !== "string"
+        || typeof input.credentialId !== "string" || !input.credentialId.trim()) {
+        throw new Error("Organization, actor, and credential IDs are required.");
+      }
+      await assertManager(input.organizationId, input.actorId);
+      const client = await pool.connect();
+      let begun = false;
+      try {
+        await client.query("BEGIN");
+        begun = true;
+        const selected = await client.query<StoredCredentialRow>(
+          `SELECT credential_id, organization_id, agent_id, key_prefix, allowed_actions,
+                  status, created_at, last_used_at, expires_at
+           FROM backstop_agent_credentials
+           WHERE organization_id = $1 AND credential_id = $2 AND status = 'active'
+           FOR UPDATE`,
+          [input.organizationId, input.credentialId],
+        );
+        const row = selected.rows[0];
+        if (!row) {
+          await client.query("COMMIT");
+          begun = false;
+          return false;
+        }
+        const metadata = mapCredentialMetadata(row);
+        const updated = await client.query<{ credential_id: unknown }>(
+          `UPDATE backstop_agent_credentials
+           SET status = 'revoked', revoked_at = now()
+           WHERE organization_id = $1 AND credential_id = $2 AND status = 'active'
+           RETURNING credential_id`,
+          [input.organizationId, input.credentialId],
+        );
+        if (updated.rows.length !== 1) throw new Error("Credential status changed before revocation completed.");
+        await writeCredentialAudit(client, {
+          organizationId: input.organizationId,
+          credentialId: metadata.credentialId,
+          actorId: input.actorId,
+          agentId: metadata.agentId,
+          keyPrefix: metadata.keyPrefix,
+          action: "CREDENTIAL_REVOKED",
+        });
+        await client.query("COMMIT");
+        begun = false;
+        return true;
+      } catch (error) {
+        if (begun) {
+          try { await client.query("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+        }
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+  };
+}
