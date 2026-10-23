@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { runPolicyScenarios } from "./scenarios.js";
-import type { ActionRequest } from "./index.js";
+import { POLICY_VERSION, type ActionRequest } from "./index.js";
 
 function request(overrides: Partial<ActionRequest> = {}): ActionRequest {
   return {
@@ -40,7 +40,7 @@ describe("policy scenario runner", () => {
     expect(report.passed).toBe(3);
     expect(report.failed).toBe(0);
     expect(report.results.every((result) => result.passed)).toBe(true);
-    expect(report.policyVersion).toBe("backstop-baseline-1.0.0");
+    expect(report.policyVersion).toBe(POLICY_VERSION);
   });
 
   it("marks an unexpected decision as a failed scenario instead of hiding it", () => {
