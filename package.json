@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "@backstop/core": "0.1.0",
-    "lucide-react": "^0.468.0",
+    "lucide-react": "^1.60.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
