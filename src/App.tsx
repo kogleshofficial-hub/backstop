@@ -20,22 +20,40 @@ interface Proposal {
 }
 interface AuditEvent { id: string; at: string; actor: string; kind: EventKind; title: string; detail: string; }
 const KEYS = { proposals: "backstop.v1.proposals", audit: "backstop.v1.audit", rules: "backstop.v1.rules" };
-const SNIPPET = `import { evaluateAction } from "@backstop/core";
+const SNIPPET = `import { Pool } from "pg";
+import { createExecutionGate } from "@backstop/core/execution-gate";
+import { createPostgresExecutionGateDependencies } from "@backstop/core/postgres-adapter";
 
-const result = evaluateAction({
-  id: crypto.randomUUID(),
-  agent: "support-agent",
-  actionType: "send_external",
-  resource: "email/customer-export.csv",
-  summary: "Send an export externally"
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// Implement these with your real authenticated identity and object-level ACL.
+const dependencies = createPostgresExecutionGateDependencies(pool, {
+  authorizeResource: ({ agent, actionType, resource }) =>
+    appAcl.canInvoke(agent.id, agent.organizationId, actionType, resource),
+  authorizeReviewer: ({ organizationId, reviewerId }) =>
+    membershipStore.canReviewAIApprovals(organizationId, reviewerId),
 });
 
-if (result.decision === "BLOCK") throw new Error("Blocked");
-if (result.decision === "REQUIRE_APPROVAL") {
-  // Persist request and pause until an authenticated reviewer decides.
-  return pauseAgentExecution();
+const gate = createExecutionGate(serverRegisteredTools, dependencies);
+
+// Run inside an authenticated server route, never browser code.
+const result = await gate.invoke({
+  requestId: crypto.randomUUID(),
+  agent: authenticatedAgent,
+  toolName: "documents.read",
+  input: validatedBody,
+});
+
+if (result.status === "approval_required") {
+  return Response.json({ requestId: result.request.id, decision: "REQUIRE_APPROVAL" }, { status: 202 });
 }
-// Only ALLOW may reach the separately implemented tool call.`;
+if (result.status === "blocked") {
+  return Response.json({ error: result.reason }, { status: 403 });
+}
+if (result.status !== "executed") {
+  return Response.json({ error: result.reason }, { status: 500 });
+}
+return Response.json({ output: result.output });`;
 const NAV: { id: Page; label: string; icon: LucideIcon; group: string }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard, group: "CONTROL" },
   { id: "requests", label: "Action requests", icon: Activity, group: "CONTROL" },
@@ -259,12 +277,12 @@ export default function App() {
           <section className="panel audit-panel"><div className="panel-heading"><div><div className="kicker">EVENT STREAM</div><h3>{events.length} recorded events</h3></div><span className="panel-meta">Newest first</span></div><AuditList events={events} /></section>
         </section>}
 
-        {page === "developer" && <section className="page-section"><div className="page-intro"><div><div className="eyebrow"><i /> BUILD WITH BACKSTOP</div><h2>Developer center</h2><p>The engine is provider-independent, deterministic, and needs no AI credits.</p></div><a className="btn quiet" href="https://github.com/kogleshofficial-hub/backstop" target="_blank" rel="noreferrer"><Github size={16} /> Repository <ExternalLink size={13} /></a></div>
+        {page === "developer" && <section className="page-section"><div className="page-intro"><div><div className="eyebrow"><i /> BUILD WITH BACKSTOP</div><h2>Developer center</h2><p>The policy core is model-free. PostgreSQL-backed server components can enforce decisions before a registered tool runs.</p></div><a className="btn quiet" href="https://github.com/kogleshofficial-hub/backstop" target="_blank" rel="noreferrer"><Github size={16} /> Repository <ExternalLink size={13} /></a></div>
           <div className="developer-hero"><div className="dev-symbol"><Terminal size={23} /></div><div><div className="kicker">TYPESCRIPT CORE</div><h3>Check first. Execute second.</h3><p>Run a policy decision immediately before a tool call. Never execute first and check later.</p></div><span className="engine-pill"><i /> Local engine</span></div>
-          <div className="developer-grid"><section className="panel code-panel"><div className="code-head"><div><div className="kicker">INTEGRATION PATTERN</div><strong>Evaluate a proposed action</strong></div><button className="btn quiet btn-sm" onClick={copySnippet}><Copy size={14} /> Copy code</button></div><pre className="code-block"><code>{SNIPPET}</code></pre><div className="code-footnote"><LockKeyhole size={14} /> Example only: no caller authentication or real tool execution.</div></section>
+          <div className="developer-grid"><section className="panel code-panel"><div className="code-head"><div><div className="kicker">INTEGRATION PATTERN</div><strong>Gate a real server-side action</strong></div><button className="btn quiet btn-sm" onClick={copySnippet}><Copy size={14} /> Copy code</button></div><pre className="code-block"><code>{SNIPPET}</code></pre><div className="code-footnote"><LockKeyhole size={14} /> Integration pattern: implement trusted auth/ACL callbacks and server-registered tools. The local console does not execute this code.</div></section>
             <section className="panel"><div className="panel-heading"><div><div className="kicker">DECISION CONTRACT</div><h3>Possible outcomes</h3></div></div><div className="definition"><span className="decision-tag green">ALLOW</span><div><strong>Proceed to tool adapter</strong><p>Only after server-side identity and resource checks also pass.</p></div></div><div className="definition"><span className="decision-tag red">BLOCK</span><div><strong>Stop execution</strong><p>Locked baseline safeguards or matched restrictions deny the request.</p></div></div><div className="definition"><span className="decision-tag amber">REVIEW</span><div><strong>Pause for a reviewer</strong><p>Persist the request and wait for an authenticated decision.</p></div></div></section>
           </div>
-          <section className="panel checklist"><div className="panel-heading"><div><div className="kicker">BEFORE PRODUCTION</div><h3>Required engineering work</h3></div></div>{[["Authenticate every agent", "An agent must not be able to claim another agent's identity."], ["Enforce at the execution boundary", "The adapter must check the decision before any side effect."], ["Persist approvals on the server", "Verify reviewer identity, tenancy, expiry and exact payload server-side."], ["Add bypass and replay tests", "Test altered payloads, stale approvals, retries and direct tool calls."]].map(([heading, detail], index) => <div className="checklist-row" key={heading}><code>0{index + 1}</code><div><strong>{heading}</strong><p>{detail}</p></div><span>Not yet implemented</span></div>)}</section>
+          <section className="panel checklist"><div className="panel-heading"><div><div className="kicker">BEFORE PRODUCTION</div><h3>Required engineering work</h3></div></div>{[["Authenticate every agent", "Expiring, hashed, organization-scoped machine credentials are available; host routes must authenticate sessions and protect management APIs."], ["Enforce at the execution boundary", "The server-side gate wraps registered tools and checks policy, action scope, resource ACL, approval, audit and replay claim."], ["Persist approvals on the server", "The PostgreSQL adapter stores review requests and atomically consumes approval evidence; connect it to authenticated reviewer routes."], ["Add bypass and replay tests", "Unit regression tests cover malformed policies, approval binding, duplicates and storage failures; real adversarial integration tests remain required."]].map(([heading, detail], index) => <div className="checklist-row" key={heading}><code>0{index + 1}</code><div><strong>{heading}</strong><p>{detail}</p></div><span>{["Core + integration required", "Core available", "PostgreSQL adapter available", "Unit tests added; integration pending"][index]}</span></div>)}</section>
         </section>}
       </div>
     </main>
