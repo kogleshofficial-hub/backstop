@@ -918,7 +918,6 @@ export function createPostgresPolicyService(
       const version = `org_${revision.replaceAll("-", "")}`;
       const client = await pool.connect();
       let begun = false;
-      const publishedAt = new Date().toISOString();
       try {
         await client.query("BEGIN");
         begun = true;
