@@ -43,10 +43,12 @@ npm audit --audit-level=high
 
 The gate, storage, and policy-management APIs are package entry points:
 
-- `@backstop/core/execution-gate`
-- `@backstop/core/postgres-adapter`
-- `@backstop/core/scenarios`
-- `@backstop/core/postgres-adapter` — PostgreSQL storage, approval queue, machine credential service, and versioned policy manager
+- `@backstop/core` — deterministic policy evaluator.
+- `@backstop/core/scenarios` — model-free policy regression runner.
+- `@backstop/core/execution-gate` — server-side registered-tool gate.
+- `@backstop/core/postgres-adapter` — PostgreSQL storage, approval queue, machine credential service, and versioned policy manager.
+
+The package-level [SDK README](packages/core/README.md) describes downstream integration.
 
 The PostgreSQL adapter accepts a compatible `pg.Pool`. Install the host app's database client with `npm install pg` and `npm install -D @types/pg`, configure `DATABASE_URL` as a server-side secret, then apply the schema with:
 
@@ -54,7 +56,7 @@ The PostgreSQL adapter accepts a compatible `pg.Pool`. Install the host app's da
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/core/migrations/001_execution_control.sql
 ```
 
-See [the execution-gate setup guide](docs/execution-gate.md), [agent credentials](docs/agent-credentials.md), [the storage adapter contract](docs/storage-adapter-contract.md), and [policy testing](docs/policy-testing.md). Never expose database credentials in browser code or commit them to the repository.
+See [the execution-gate setup guide](docs/execution-gate.md), [agent credentials](docs/agent-credentials.md), [the storage adapter contract](docs/storage-adapter-contract.md), [policy testing](docs/policy-testing.md), and [the production launch checklist](docs/launch-readiness.md). Read [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the [unreleased changelog](CHANGELOG.md) before contributing. Never expose database credentials in browser code or commit them to the repository.
 
 ## Important production boundary
 
