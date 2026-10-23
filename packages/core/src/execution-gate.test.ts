@@ -33,15 +33,18 @@ function harness(options: {
   authorizeResource?: (args: { agent: AuthenticatedAgent; actionType: "read_resource" | "write_resource" | "delete_resource" | "send_external"; resource: string }) => Promise<boolean>;
   verifyAndConsumeApproval?: (args: { agent: AuthenticatedAgent; request: GuardedActionRequest; inputDigest: string; approval: { requestId: string; approvalId: string } }) => Promise<boolean>;
   claimExecution?: (args: { agent: AuthenticatedAgent; request: GuardedActionRequest; toolName: string }) => Promise<boolean>;
+  recordApprovalRequest?: (args: { agent: AuthenticatedAgent; request: GuardedActionRequest; evaluation: { decision: "ALLOW" | "BLOCK" | "REQUIRE_APPROVAL"; reason: string; matchedRules: PolicyRule[]; policyVersion: string } }) => Promise<void>;
   appendAudit?: (event: GateAuditEvent) => Promise<void>;
 } = {}) {
   const events: GateAuditEvent[] = [];
+  const approvalRequests: GuardedActionRequest[] = [];
   const claims = new Set<string>();
   const execute = options.tool?.execute ?? vi.fn(async (input: Input) => input.resource);
   const gate = createExecutionGate([options.tool ?? makeTool({ execute })], {
     getRules: async () => options.rules ?? [],
     authorizeResource: options.authorizeResource ?? (async () => true),
     verifyAndConsumeApproval: options.verifyAndConsumeApproval ?? (async () => false),
+    recordApprovalRequest: options.recordApprovalRequest ?? (async ({ request }) => { approvalRequests.push(request); }),
     claimExecution: options.claimExecution ?? (async ({ agent: principal, request }) => {
       const key = `${principal.organizationId}:${request.id}`;
       if (claims.has(key)) return false;
@@ -50,7 +53,7 @@ function harness(options: {
     }),
     appendAudit: options.appendAudit ?? (async (event) => { events.push(event); }),
   });
-  return { gate, events, execute, claims };
+  return { gate, events, execute, claims, approvalRequests };
 }
 const invoke = (overrides: Partial<{ requestId: string; agent: AuthenticatedAgent; toolName: string; input: unknown; approval: { requestId: string; approvalId: string } }> = {}) => ({
   requestId: "request-1", agent, toolName: "documents.read", input: { resource: "docs/readme.md" }, ...overrides,
@@ -97,13 +100,15 @@ describe("server execution gate", () => {
     expect(h.events[0].kind).toBe("BLOCKED");
   });
 
-  it("requires approval for sensitive actions and does not execute without evidence", async () => {
+  it("persists a pending approval request and does not execute without evidence", async () => {
     const tool = makeTool({ name: "mail.send", actionType: "send_external" });
     const h = harness({ tool });
     const result = await h.gate.invoke(invoke({ toolName: "mail.send" }));
     expect(result.status).toBe("approval_required");
     expect(h.execute).not.toHaveBeenCalled();
     expect(h.events[0].kind).toBe("APPROVAL_REQUIRED");
+    expect(h.approvalRequests).toHaveLength(1);
+    expect(h.approvalRequests[0].inputDigest).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it("executes a reviewed action only after trusted approval verification", async () => {
@@ -163,6 +168,7 @@ describe("server execution gate", () => {
       getRules: async () => { throw new Error("storage unavailable"); },
       authorizeResource: async () => true,
       verifyAndConsumeApproval: async () => false,
+      recordApprovalRequest: async () => {},
       claimExecution: async () => true,
       appendAudit: async (event) => { h.events.push(event); },
     });
