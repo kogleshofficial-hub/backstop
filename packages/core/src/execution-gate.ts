@@ -104,6 +104,15 @@ export interface ExecutionGateDependencies {
     approval: ApprovalEvidence;
   }): Promise<boolean>;
   /**
+   * Persist a request that requires human review. This must be idempotent by organization + request
+   * ID, refuse conflicting input digests, and retain the exact action/policy metadata for review.
+   */
+  recordApprovalRequest(input: {
+    agent: AuthenticatedAgent;
+    request: GuardedActionRequest;
+    evaluation: Evaluation;
+  }): Promise<void>;
+  /**
    * Atomically claim a one-time execution slot keyed by organizationId + request.id.
    * Persist the inputDigest and refuse existing/in-progress/completed IDs, including a reused
    * ID paired with a different digest. This must be backed by a durable unique constraint or
@@ -370,6 +379,18 @@ export function createExecutionGate(
 
           if (!verified) {
             const reason = "A valid, unexpired approval bound to this exact request is required.";
+            try {
+              await dependencies.recordApprovalRequest({ agent, request, evaluation });
+            } catch {
+              const queueReason = "The durable approval-request store is unavailable. No action was executed.";
+              await appendAudit({
+                requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
+                toolName: tool.name, kind: "GATE_ERROR", decision: evaluation.decision,
+                actionType: request.actionType, resource: request.resource, inputDigest: request.inputDigest,
+                reason: queueReason, policyVersion: evaluation.policyVersion,
+              });
+              return { status: "error", request, evaluation, reason: queueReason };
+            }
             const logged = await appendAudit({
               requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
               toolName: tool.name, kind: "APPROVAL_REQUIRED", decision: evaluation.decision,
