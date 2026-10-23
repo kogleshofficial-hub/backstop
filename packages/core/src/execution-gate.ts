@@ -103,6 +103,17 @@ export interface ExecutionGateDependencies {
     inputDigest: string;
     approval: ApprovalEvidence;
   }): Promise<boolean>;
+  /**
+   * Atomically claim a one-time execution slot keyed by organizationId + request.id.
+   * Persist the inputDigest and refuse existing/in-progress/completed IDs, including a reused
+   * ID paired with a different digest. This must be backed by a durable unique constraint or
+   * transaction, not an in-memory Set; throw on storage failure so the gate fails closed.
+   */
+  claimExecution(input: {
+    agent: AuthenticatedAgent;
+    request: GuardedActionRequest;
+    toolName: string;
+  }): Promise<boolean>;
   /** Append to server-controlled audit storage. Do not implement this with browser localStorage. */
   appendAudit(event: GateAuditEvent): Promise<void>;
 }
@@ -385,6 +396,33 @@ export function createExecutionGate(
         });
         if (!startLogged) {
           return { status: "error", request, evaluation, reason: "Audit storage is unavailable. No action was executed." };
+        }
+
+        let claimed = false;
+        try {
+          claimed = await dependencies.claimExecution({ agent, request, toolName: tool.name });
+        } catch {
+          const reason = "The durable execution-claim store is unavailable. No action was executed.";
+          await appendAudit({
+            requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
+            toolName: tool.name, kind: "GATE_ERROR", decision: "BLOCK",
+            actionType: request.actionType, resource: request.resource, inputDigest: request.inputDigest,
+            reason, policyVersion: evaluation.policyVersion,
+          });
+          return { status: "error", request, evaluation, reason };
+        }
+
+        if (!claimed) {
+          const reason = "This request ID was already claimed or conflicts with an earlier payload. No action was executed.";
+          const logged = await appendAudit({
+            requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
+            toolName: tool.name, kind: "BLOCKED", decision: "BLOCK",
+            actionType: request.actionType, resource: request.resource, inputDigest: request.inputDigest,
+            reason, policyVersion: evaluation.policyVersion,
+          });
+          return logged
+            ? { status: "blocked", request, evaluation: buildEvaluation("BLOCK", reason, evaluation.policyVersion), reason }
+            : { status: "error", request, evaluation, reason: "Duplicate execution was refused, but audit storage is unavailable." };
         }
 
         let output: TOutput;
