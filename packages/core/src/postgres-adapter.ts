@@ -199,13 +199,12 @@ export function createPostgresExecutionGateDependencies(
         `SELECT organization_id, request_id, agent_id, tool_name, action_type, resource, summary,
                 input_digest, policy_version, status, reviewer_id, expires_at
          FROM backstop_approval_requests
-         WHERE organization_id = $1 AND request_id = $2`,
+         WHERE organization_id = $1 AND request_id = $2 AND expires_at > now()`,
         [agent.organizationId, request.id],
       );
       const row = existing.rows[0];
       if (!row || !stringsMatch(row, request, agent)
-        || !["pending", "approved"].includes(String(row.status))
-        || !(row.expires_at instanceof Date ? row.expires_at.getTime() > Date.now() : new Date(String(row.expires_at)).getTime() > Date.now())) {
+        || !["pending", "approved"].includes(String(row.status))) {
         throw new Error("A conflicting, expired, or already-used approval request ID exists.");
       }
       // Idempotent duplicate of the same still-open request. Never overwrite its status/digest.
@@ -653,7 +652,6 @@ export function createPostgresAgentCredentialService(
       const secret = `bsk_live_${secureSecretPart()}`;
       const keyPrefix = `bsk_live_${secret.slice("bsk_live_".length, "bsk_live_".length + 8)}`;
       const tokenHash = await sha256Hex(secret);
-      const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
       const client = await pool.connect();
       let begun = false;
       try {
@@ -663,10 +661,10 @@ export function createPostgresAgentCredentialService(
           `INSERT INTO backstop_agent_credentials
              (credential_id, organization_id, agent_id, key_prefix, token_hash, allowed_actions,
               status, created_by, expires_at)
-           VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8)
+           VALUES ($1,$2,$3,$4,$5,$6,'active',$7,now() + ($8 * interval '1 second'))
            RETURNING credential_id, organization_id, agent_id, key_prefix, allowed_actions,
                      status, created_at, last_used_at, expires_at`,
-          [credentialId, input.organizationId, input.agentId, keyPrefix, tokenHash, actions, input.actorId, expiresAt],
+          [credentialId, input.organizationId, input.agentId, keyPrefix, tokenHash, actions, input.actorId, ttlSeconds],
         );
         const row = inserted.rows[0];
         if (!row) throw new Error("The database did not create the credential.");
@@ -951,7 +949,7 @@ export function createPostgresPolicyService(
         );
         await client.query("COMMIT");
         begun = false;
-        return { organizationId: input.organizationId, version, rules, publishedAt };
+        return { organizationId: input.organizationId, version, rules, publishedAt: new Date().toISOString() };
       } catch (error) {
         if (begun) {
           try { await client.query("ROLLBACK"); } catch { /* Preserve the original failure. */ }
