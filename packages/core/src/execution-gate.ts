@@ -24,10 +24,16 @@ export interface ApprovalEvidence {
   approvalId: string;
 }
 
+export interface GuardedActionRequest extends ActionRequest {
+  /** SHA-256 of canonical JSON input; approval must be bound to this exact payload. */
+  inputDigest: string;
+}
+
 export interface GuardedToolContext {
   agent: AuthenticatedAgent;
-  request: ActionRequest;
+  request: GuardedActionRequest;
   evaluation: Evaluation;
+  inputDigest: string;
 }
 
 export interface GuardedTool<TInput = unknown, TOutput = unknown> {
@@ -69,6 +75,7 @@ export interface GateAuditEvent {
   policyVersion: string;
   actionType?: ActionType;
   resource?: string;
+  inputDigest?: string;
   reason: string;
 }
 
@@ -85,13 +92,15 @@ export interface ExecutionGateDependencies {
     resource: string;
   }): Promise<boolean>;
   /**
-   * Verify a durable, unexpired approval that is bound to this exact request and organization.
-   * Validate reviewer permissions, approval status, request/payload digest, expiry and replay state
-   * in your trusted store. Returning true is a security-sensitive decision.
+   * Atomically validate AND consume a durable, unexpired approval bound to this request,
+   * organization and input digest. Check reviewer rights and prevent concurrent replay in the
+   * trusted store (for example, using a transaction that changes pending -> consumed only once).
+   * A read-only "is approved" check is not sufficient. Returning true authorizes execution.
    */
-  verifyApproval(input: {
+  verifyAndConsumeApproval(input: {
     agent: AuthenticatedAgent;
-    request: ActionRequest;
+    request: GuardedActionRequest;
+    inputDigest: string;
     approval: ApprovalEvidence;
   }): Promise<boolean>;
   /** Append to server-controlled audit storage. Do not implement this with browser localStorage. */
@@ -109,10 +118,10 @@ export interface InvokeGuardedToolInput {
 }
 
 export type ExecutionGateResult<TOutput = unknown> =
-  | { status: "executed"; request: ActionRequest; evaluation: Evaluation; output: TOutput; auditComplete: boolean }
-  | { status: "blocked"; request?: ActionRequest; evaluation?: Evaluation; reason: string }
-  | { status: "approval_required"; request: ActionRequest; evaluation: Evaluation; reason: string }
-  | { status: "execution_failed"; request: ActionRequest; evaluation: Evaluation; auditComplete: boolean; reason: string }
+  | { status: "executed"; request: GuardedActionRequest; evaluation: Evaluation; output: TOutput; auditComplete: boolean }
+  | { status: "blocked"; request?: GuardedActionRequest; evaluation?: Evaluation; reason: string }
+  | { status: "approval_required"; request: GuardedActionRequest; evaluation: Evaluation; reason: string }
+  | { status: "execution_failed"; request: GuardedActionRequest; evaluation: Evaluation; auditComplete: boolean; reason: string }
   | { status: "error"; request?: ActionRequest; evaluation?: Evaluation; reason: string };
 
 const knownActions = new Set<string>(ACTION_CATALOG.map((action) => action.type));
@@ -185,6 +194,33 @@ function snapshotJson(value: unknown, ancestors = new WeakSet<object>()): unknow
   return Object.freeze(result);
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) throw new Error("Value cannot be encoded as JSON.");
+    return encoded;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) throw new Error("Value cannot be encoded as JSON.");
+    return encoded;
+  }
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  if (typeof value === "object" && value !== null) {
+    const object = value as Record<string, unknown>;
+    const keys = Object.keys(object).sort();
+    return "{" + keys.map((key) => JSON.stringify(key) + ":" + canonicalJson(object[key])).join(",") + "}";
+  }
+  throw new Error("Tool input cannot be canonicalized as JSON.");
+}
+
+async function sha256Json(value: unknown): Promise<string> {
+  if (!globalThis.crypto?.subtle) throw new Error("Web Crypto is required to bind approvals to action input.");
+  const bytes = new TextEncoder().encode(canonicalJson(value));
+  const hash = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function buildEvaluation(
   decision: Decision,
   reason: string,
@@ -253,13 +289,21 @@ export function createExecutionGate(
           : { status: "error", reason: "Audit storage is unavailable. No action was executed." };
       }
 
-      let request: ActionRequest | undefined;
+      const agent: AuthenticatedAgent = Object.freeze({
+        id: input.agent.id,
+        organizationId: input.agent.organizationId,
+        allowedActions: Object.freeze([...input.agent.allowedActions]),
+      });
+
+      let request: GuardedActionRequest | undefined;
+      let inputDigest: string | undefined;
       let evaluation: Evaluation | undefined;
 
       try {
         const parsed = tool.parseInput(input.input);
         const safeInput = snapshotJson(parsed);
-        const description = tool.describe(safeInput, input.agent);
+        inputDigest = await sha256Json(safeInput);
+        const description = tool.describe(safeInput, agent);
 
         if (!safeText(description?.resource, 4096) || !safeText(description?.summary, 1024)) {
           throw new Error("Tool resource and summary must be safe, non-empty text.");
@@ -267,34 +311,35 @@ export function createExecutionGate(
 
         request = {
           id: input.requestId,
-          agent: input.agent.id,
+          agent: agent.id,
+          inputDigest,
           actionType: tool.actionType,
           resource: description.resource,
           summary: description.summary,
           requestedAt: new Date().toISOString(),
         };
 
-        if (!input.agent.allowedActions.includes(tool.actionType)) {
+        if (!agent.allowedActions.includes(tool.actionType)) {
           evaluation = buildEvaluation("BLOCK", "The authenticated agent is not permitted to use this action type.");
         } else {
           const authorized = await dependencies.authorizeResource({
-            agent: input.agent,
+            agent: agent,
             actionType: tool.actionType,
             resource: request.resource,
           });
           if (!authorized) {
             evaluation = buildEvaluation("BLOCK", "The authenticated agent is not authorized for this resource.");
           } else {
-            const rules = await dependencies.getRules(input.agent);
+            const rules = await dependencies.getRules(agent);
             evaluation = evaluateAction(request, rules);
           }
         }
 
         if (evaluation.decision === "BLOCK") {
           const logged = await appendAudit({
-            requestId: request.id, organizationId: input.agent.organizationId, agentId: input.agent.id,
+            requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
             toolName: tool.name, kind: "BLOCKED", decision: evaluation.decision,
-            actionType: request.actionType, resource: request.resource, reason: evaluation.reason,
+            actionType: request.actionType, resource: request.resource, inputDigest: request.inputDigest, reason: evaluation.reason,
             policyVersion: evaluation.policyVersion,
           });
           return logged
@@ -306,7 +351,7 @@ export function createExecutionGate(
           let verified = false;
           if (input.approval && input.approval.requestId === request.id && safeText(input.approval.approvalId, 256)) {
             try {
-              verified = await dependencies.verifyApproval({ agent: input.agent, request, approval: input.approval });
+              verified = await dependencies.verifyAndConsumeApproval({ agent, request, inputDigest: request.inputDigest, approval: input.approval });
             } catch {
               verified = false;
             }
@@ -315,7 +360,7 @@ export function createExecutionGate(
           if (!verified) {
             const reason = "A valid, unexpired approval bound to this exact request is required.";
             const logged = await appendAudit({
-              requestId: request.id, organizationId: input.agent.organizationId, agentId: input.agent.id,
+              requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
               toolName: tool.name, kind: "APPROVAL_REQUIRED", decision: evaluation.decision,
               actionType: request.actionType, resource: request.resource, reason,
               policyVersion: evaluation.policyVersion,
@@ -333,9 +378,9 @@ export function createExecutionGate(
         }
 
         const startLogged = await appendAudit({
-          requestId: request.id, organizationId: input.agent.organizationId, agentId: input.agent.id,
+          requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
           toolName: tool.name, kind: "EXECUTION_AUTHORIZED", decision: evaluation.decision,
-          actionType: request.actionType, resource: request.resource, reason: evaluation.reason,
+          actionType: request.actionType, resource: request.resource, inputDigest: request.inputDigest, reason: evaluation.reason,
           policyVersion: evaluation.policyVersion,
         });
         if (!startLogged) {
@@ -344,10 +389,10 @@ export function createExecutionGate(
 
         let output: TOutput;
         try {
-          output = await tool.execute(safeInput, { agent: input.agent, request, evaluation }) as TOutput;
+          output = await tool.execute(safeInput, { agent, request, evaluation, inputDigest: request.inputDigest }) as TOutput;
         } catch {
           const completedLog = await appendAudit({
-            requestId: request.id, organizationId: input.agent.organizationId, agentId: input.agent.id,
+            requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
             toolName: tool.name, kind: "EXECUTION_FAILED", decision: evaluation.decision,
             actionType: request.actionType, resource: request.resource,
             reason: "The registered tool execution failed.", policyVersion: evaluation.policyVersion,
@@ -361,7 +406,7 @@ export function createExecutionGate(
         }
 
         const completedLog = await appendAudit({
-          requestId: request.id, organizationId: input.agent.organizationId, agentId: input.agent.id,
+          requestId: request.id, organizationId: agent.organizationId, agentId: agent.id,
           toolName: tool.name, kind: "EXECUTION_SUCCEEDED", decision: evaluation.decision,
           actionType: request.actionType, resource: request.resource,
           reason: "The registered tool completed successfully.", policyVersion: evaluation.policyVersion,
@@ -369,7 +414,7 @@ export function createExecutionGate(
         return { status: "executed", request, evaluation, output, auditComplete: completedLog };
       } catch {
         const logged = await appendAudit({
-          requestId: input.requestId, organizationId: input.agent.organizationId, agentId: input.agent.id,
+          requestId: input.requestId, organizationId: agent.organizationId, agentId: agent.id,
           toolName: tool.name, kind: "GATE_ERROR", decision: evaluation?.decision ?? null,
           actionType: request?.actionType, resource: request?.resource,
           reason: "The gate could not validate or authorize this request. No action was executed.",
