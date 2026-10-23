@@ -791,3 +791,169 @@ export function createPostgresAgentCredentialService(
     },
   };
 }
+
+
+export interface PostgresPolicyServiceOptions {
+  /** Must authorize policy administrators from trusted organization membership data. */
+  authorizePolicyManagement(input: { organizationId: string; actorId: string }): Promise<boolean>;
+}
+
+export interface PublishedPolicy {
+  organizationId: string;
+  version: string;
+  rules: PolicyRule[];
+  publishedAt: string;
+}
+
+function normalizePublishRules(rules: readonly PolicyRule[]): PolicyRule[] {
+  if (!Array.isArray(rules) || rules.length > 200) {
+    throw new Error("A policy must contain between 0 and 200 rules.");
+  }
+  const seenIds = new Set<string>();
+  return rules.map((rule) => {
+    if (!rule || typeof rule !== "object") throw new Error("Policy contains an invalid rule.");
+    if (typeof rule.id !== "string" || !rule.id.trim() || rule.id.length > 120
+      || seenIds.has(rule.id.trim())) {
+      throw new Error("Policy rule IDs must be unique, non-empty, and at most 120 characters.");
+    }
+    seenIds.add(rule.id.trim());
+    if (typeof rule.name !== "string" || !rule.name.trim() || rule.name.length > 200
+      || typeof rule.description !== "string" || !rule.description.trim() || rule.description.length > 2000) {
+      throw new Error("Policy rule name/description is missing or too long.");
+    }
+    if (rule.effect !== "BLOCK" && rule.effect !== "REQUIRE_APPROVAL") {
+      throw new Error("Custom organization policies cannot grant ALLOW permissions.");
+    }
+    if (!Array.isArray(rule.actionTypes) || rule.actionTypes.length < 1 || rule.actionTypes.length > ACTION_CATALOG.length
+      || !rule.actionTypes.every(isActionType)) {
+      throw new Error("Policy rule contains an invalid action scope.");
+    }
+    if (!Array.isArray(rule.resources) || rule.resources.length < 1 || rule.resources.length > 100
+      || !rule.resources.every((resource) => typeof resource === "string" && !!resource.trim() && resource.length <= 1024)) {
+      throw new Error("Policy rule contains invalid resource patterns.");
+    }
+    if (typeof rule.enabled !== "boolean" || typeof rule.priority !== "number"
+      || !Number.isFinite(rule.priority) || Math.abs(rule.priority) > 1000000) {
+      throw new Error("Policy rule contains an invalid enabled/priority setting.");
+    }
+    return {
+      id: rule.id.trim(),
+      name: rule.name.trim(),
+      description: rule.description.trim(),
+      effect: rule.effect,
+      actionTypes: [...new Set(rule.actionTypes)],
+      resources: [...new Set(rule.resources.map((resource) => resource.trim()))],
+      enabled: rule.enabled,
+      priority: Math.trunc(rule.priority),
+      locked: false,
+    };
+  });
+}
+
+/**
+ * Versioned PostgreSQL policy manager. Each publication is written in one transaction;
+ * prior versions remain stored for inspection while the policy-set row points at the current one.
+ */
+export function createPostgresPolicyService(
+  pool: PgPool,
+  options: PostgresPolicyServiceOptions,
+) {
+  if (!pool || typeof pool.query !== "function" || typeof pool.connect !== "function") {
+    throw new Error("A compatible PostgreSQL pool is required.");
+  }
+  if (typeof options?.authorizePolicyManagement !== "function") {
+    throw new Error("A policy-management authorization callback is required.");
+  }
+
+  async function assertManager(organizationId: string, actorId: string): Promise<void> {
+    if (!organizationId.trim() || !actorId.trim()
+      || !await options.authorizePolicyManagement({ organizationId, actorId })) {
+      throw new Error("Policy management is not authorized for this organization.");
+    }
+  }
+
+  async function loadCurrent(organizationId: string): Promise<{ version: string; rules: PolicyRule[] }> {
+    if (typeof organizationId !== "string" || !organizationId.trim()) {
+      throw new Error("A trusted organization ID is required.");
+    }
+    // One statement gives a consistent version+rules snapshot even while an administrator publishes.
+    const result = await pool.query<StoredRuleRow & { policy_version: unknown }>(
+      `SELECT ps.policy_version, r.rule_id, r.name, r.description, r.effect,
+              r.action_types, r.resource_patterns, r.enabled, r.priority
+       FROM backstop_policy_sets ps
+       LEFT JOIN backstop_policy_rules r
+         ON r.organization_id = ps.organization_id AND r.policy_version = ps.policy_version
+       WHERE ps.organization_id = $1
+       ORDER BY r.priority DESC NULLS LAST, r.rule_id ASC NULLS LAST`,
+      [organizationId],
+    );
+    if (result.rows.length === 0) return { version: "baseline", rules: [] };
+    const version = nonEmptyString(result.rows[0].policy_version, "policy_version");
+    const rules = result.rows
+      .filter((row) => row.rule_id !== null && row.rule_id !== undefined)
+      .map(mapPolicyRule);
+    return { version, rules };
+  }
+
+  return {
+    loadCurrent,
+
+    async publish(input: {
+      organizationId: string;
+      actorId: string;
+      rules: readonly PolicyRule[];
+    }): Promise<PublishedPolicy> {
+      if (!input || typeof input.organizationId !== "string" || typeof input.actorId !== "string"
+        || !input.organizationId.trim() || !input.actorId.trim()) {
+        throw new Error("Organization and actor IDs are required.");
+      }
+      await assertManager(input.organizationId, input.actorId);
+      const rules = normalizePublishRules(input.rules);
+      const revision = globalThis.crypto?.randomUUID?.();
+      if (!revision) throw new Error("A cryptographically secure UUID source is required.");
+      const version = `org_${revision.replaceAll("-", "")}`;
+      const client = await pool.connect();
+      let begun = false;
+      const publishedAt = new Date().toISOString();
+      try {
+        await client.query("BEGIN");
+        begun = true;
+        await client.query(
+          `INSERT INTO backstop_policy_sets (organization_id, policy_version, updated_at)
+           VALUES ($1,$2,now())
+           ON CONFLICT (organization_id) DO UPDATE
+             SET policy_version = EXCLUDED.policy_version, updated_at = now()`,
+          [input.organizationId, version],
+        );
+        for (const rule of rules) {
+          await client.query(
+            `INSERT INTO backstop_policy_rules
+               (organization_id, policy_version, rule_id, name, description, effect, action_types,
+                resource_patterns, enabled, priority)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+            [input.organizationId, version, rule.id, rule.name, rule.description, rule.effect,
+              rule.actionTypes, rule.resources, rule.enabled, rule.priority],
+          );
+        }
+        await client.query(
+          `INSERT INTO backstop_audit_events
+             (occurred_at, organization_id, request_id, agent_id, tool_name, kind, decision,
+              policy_version, action_type, resource, input_digest, reason)
+           VALUES (now(),$1,$2,$3,'policy.management','POLICY_PUBLISHED','ALLOW',$4,NULL,NULL,NULL,$5)`,
+          [input.organizationId, `policy:${version}`, input.actorId, version,
+            `Published policy ${version} with ${rules.length} restrictive custom rule(s).`],
+        );
+        await client.query("COMMIT");
+        begun = false;
+        return { organizationId: input.organizationId, version, rules, publishedAt };
+      } catch (error) {
+        if (begun) {
+          try { await client.query("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+        }
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+  };
+}
