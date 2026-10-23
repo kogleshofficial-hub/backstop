@@ -25,8 +25,12 @@ export interface ApprovalEvidence {
 }
 
 export interface GuardedActionRequest extends ActionRequest {
+  /** Fixed by the server-registered tool definition, never the request body. */
+  toolName: string;
   /** SHA-256 of canonical JSON input; approval must be bound to this exact payload. */
   inputDigest: string;
+  /** Evaluator + organization policy revision that authorized or reviewed the action. */
+  policyVersion: string;
 }
 
 export interface GuardedToolContext {
@@ -80,8 +84,8 @@ export interface GateAuditEvent {
 }
 
 export interface ExecutionGateDependencies {
-  /** Resolve only policy rules loaded from a trusted policy store for this organization. */
-  getRules(agent: AuthenticatedAgent): Promise<readonly PolicyRule[]>;
+  /** Resolve a consistent, trusted policy snapshot for this organization. */
+  getRules(agent: AuthenticatedAgent): Promise<{ version: string; rules: readonly PolicyRule[] }>;
   /**
    * Enforce app-specific object/tenant ACLs. This is required even when policy says ALLOW.
    * It must use the authenticated agent and canonical resource; it must not trust client claims.
@@ -333,6 +337,8 @@ export function createExecutionGate(
           id: input.requestId,
           agent: agent.id,
           inputDigest,
+          toolName: tool.name,
+          policyVersion: POLICY_VERSION,
           actionType: tool.actionType,
           resource: description.resource,
           summary: description.summary,
@@ -350,10 +356,20 @@ export function createExecutionGate(
           if (!authorized) {
             evaluation = buildEvaluation("BLOCK", "The authenticated agent is not authorized for this resource.");
           } else {
-            const rules = await dependencies.getRules(agent);
-            evaluation = evaluateAction(request, rules);
+            const policy = await dependencies.getRules(agent);
+            if (!policy || !safeText(policy.version, 120) || !Array.isArray(policy.rules)) {
+              evaluation = buildEvaluation("BLOCK", "The trusted organization policy snapshot is invalid. Restore a valid policy before execution.");
+            } else {
+              const evaluated = evaluateAction(request, policy.rules);
+              evaluation = {
+                ...evaluated,
+                policyVersion: `${POLICY_VERSION};org=${policy.version}`,
+              };
+            }
           }
         }
+
+        request = Object.freeze({ ...request, policyVersion: evaluation.policyVersion });
 
         if (evaluation.decision === "BLOCK") {
           const logged = await appendAudit({
