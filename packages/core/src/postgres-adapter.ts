@@ -405,13 +405,6 @@ export function createPostgresApprovalService(
         || (input.outcome !== "approve" && input.outcome !== "reject")) {
         throw new Error("Organization, request, reviewer, and decision are required.");
       }
-      if (!await options.authorizeReviewer({
-        organizationId: input.organizationId,
-        reviewerId: input.reviewerId,
-      })) {
-        throw new Error("This reviewer is not permitted to review requests for the organization.");
-      }
-
       const client = await pool.connect();
       let begun = false;
       try {
@@ -430,6 +423,14 @@ export function createPostgresApprovalService(
         if (!row) throw new Error("Approval request is missing, expired, or already reviewed.");
         if (!isActionType(row.action_type) || !DIGEST.test(String(row.input_digest).trim())) {
           throw new Error("Stored approval request contains invalid action metadata.");
+        }
+        // Authorize inside the transaction after the target row is locked, narrowing the
+        // permission-revocation race between the reviewer check and the state transition.
+        if (!await options.authorizeReviewer({
+          organizationId: input.organizationId,
+          reviewerId: input.reviewerId,
+        })) {
+          throw new Error("This reviewer is not permitted to review requests for the organization.");
         }
 
         const decision = input.outcome === "approve" ? "APPROVAL_APPROVED" : "APPROVAL_REJECTED";
