@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
+  createPostgresAgentCredentialService,
   createPostgresExecutionGateDependencies,
   type PgConnection,
   type PgPool,
@@ -40,6 +41,7 @@ const approvalRow = (overrides: Row = {}): Row => ({
 
 class FakePool implements PgPool {
   policyVersion: string | null = "policy-v4";
+  credentials: Row[] = [];
   policyRules: Row[] = [{
     rule_id: "send-review",
     name: "Review outbound messages",
@@ -66,6 +68,37 @@ class FakePool implements PgPool {
       rows = this.policyVersion === null ? [] : [{ policy_version: this.policyVersion }];
     } else if (sql.includes("from backstop_policy_rules")) {
       rows = this.policyRules;
+    } else if (sql.startsWith("insert into backstop_agent_credentials")) {
+      const row: Row = {
+        credential_id: values[0], organization_id: values[1], agent_id: values[2],
+        key_prefix: values[3], token_hash: values[4], allowed_actions: values[5],
+        status: "active", created_by: values[6], created_at: new Date(),
+        last_used_at: null, expires_at: values[7], revoked_at: null,
+      };
+      this.credentials.push(row);
+      rows = [row];
+    } else if (sql.includes("from backstop_agent_credentials")) {
+      if (sql.includes("token_hash = $1")) {
+        rows = this.credentials.filter((row) => row.token_hash === values[0]
+          && row.status === "active" && new Date(String(row.expires_at)).getTime() > Date.now());
+      } else if (sql.includes("credential_id = $2")) {
+        rows = this.credentials.filter((row) => row.organization_id === values[0]
+          && row.credential_id === values[1] && row.status === "active");
+      } else {
+        rows = this.credentials.filter((row) => row.organization_id === values[0]);
+        rows.sort((a,b) => new Date(String(b.created_at)).getTime() - new Date(String(a.created_at)).getTime());
+      }
+    } else if (sql.startsWith("update backstop_agent_credentials")) {
+      const key = values[0];
+      const row = this.credentials.find((candidate) => candidate.credential_id === key && candidate.status === "active");
+      if (row && sql.includes("set last_used_at")) {
+        row.last_used_at = new Date();
+        rows = [{ credential_id: key }];
+      } else if (row && sql.includes("set status = 'revoked'") && row.organization_id === values[0]) {
+        // Credential revocation SQL uses [organizationId, credentialId].
+        const target = this.credentials.find((candidate) => candidate.organization_id === values[0] && candidate.credential_id === values[1] && candidate.status === "active");
+        if (target) { target.status = "revoked"; target.revoked_at = new Date(); rows = [{ credential_id: values[1] }]; }
+      }
     } else if (sql.startsWith("insert into backstop_execution_claims")) {
       if (!this.claimed) {
         this.claimed = true;
@@ -126,6 +159,79 @@ function makeDependencies(pool: FakePool) {
 }
 
 describe("PostgreSQL execution gate adapter", () => {
+  it("creates expiring credentials with one-time secrets and stores only a hash", async () => {
+    const pool = new FakePool();
+    const service = createPostgresAgentCredentialService(pool, {
+      authorizeCredentialManagement: async ({ organizationId, actorId }) =>
+        organizationId === agent.organizationId && actorId === "admin-1",
+      defaultTtlSeconds: 3600,
+    });
+    const created = await service.create({
+      organizationId: agent.organizationId,
+      actorId: "admin-1",
+      agentId: "agent-workflow",
+      allowedActions: ["read_resource", "search"],
+    });
+    expect(created.secret).toMatch(/^bsk_live_[A-Za-z0-9_-]{43}$/);
+    expect(created.keyPrefix).toMatch(/^bsk_live_[A-Za-z0-9_-]{8}$/);
+    expect(created.secret).not.toBe(pool.credentials[0].token_hash);
+    expect(pool.credentials[0].token_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(pool.credentials[0].token_hash).not.toContain(created.secret);
+    expect(pool.queries.some((query) => query.sql.includes("insert into backstop_audit_events"))).toBe(true);
+  });
+
+  it("authenticates a credential into a server-side agent principal and scopes permissions", async () => {
+    const pool = new FakePool();
+    const service = createPostgresAgentCredentialService(pool, {
+      authorizeCredentialManagement: async () => true,
+    });
+    const created = await service.create({
+      organizationId: agent.organizationId,
+      actorId: "admin-1",
+      agentId: "agent-workflow",
+      allowedActions: ["read_resource", "search"],
+      ttlSeconds: 3600,
+    });
+    const authenticated = await service.authenticate(created.secret);
+    expect(authenticated?.agent).toEqual({
+      id: "agent-workflow",
+      organizationId: agent.organizationId,
+      allowedActions: ["read_resource", "search"],
+    });
+    expect(await service.authenticate("invalid-token")).toBeNull();
+    expect((await service.list({ organizationId: agent.organizationId, actorId: "admin-1" })).length).toBe(1);
+  });
+
+  it("revokes a credential and rejects it on the next authentication", async () => {
+    const pool = new FakePool();
+    const service = createPostgresAgentCredentialService(pool, {
+      authorizeCredentialManagement: async () => true,
+    });
+    const created = await service.create({
+      organizationId: agent.organizationId,
+      actorId: "admin-1",
+      agentId: "agent-workflow",
+      allowedActions: ["read_resource"],
+      ttlSeconds: 3600,
+    });
+    expect(await service.revoke({
+      organizationId: agent.organizationId, actorId: "admin-1", credentialId: created.credentialId,
+    })).toBe(true);
+    expect(await service.authenticate(created.secret)).toBeNull();
+    expect(pool.queries.some((query) => query.sql.includes("credential-revoked"))).toBe(false);
+    expect(pool.queries.some((query) => query.sql.includes("insert into backstop_audit_events"))).toBe(true);
+  });
+
+  it("refuses credential creation without organization administrator authorization", async () => {
+    const service = createPostgresAgentCredentialService(new FakePool(), {
+      authorizeCredentialManagement: async () => false,
+    });
+    await expect(service.create({
+      organizationId: agent.organizationId, actorId: "untrusted", agentId: "agent",
+      allowedActions: ["read_resource"],
+    })).rejects.toThrow("Credential management is not authorized");
+  });
+
   it("loads a versioned restrictive policy snapshot", async () => {
     const pool = new FakePool();
     const dependencies = makeDependencies(pool);
