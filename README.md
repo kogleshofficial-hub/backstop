@@ -1,8 +1,8 @@
 # BACKSTOP
 
-**The policy gate between an AI agent and the actions it wants to take.**
+**Policy enforcement and regression testing for AI agent actions.**
 
-Backstop evaluates proposed tool actions before an application executes them. The deterministic TypeScript engine returns **ALLOW**, **BLOCK**, or **REQUIRE_APPROVAL** with an explanation and matching policy.
+Backstop evaluates proposed tool actions before an application executes them. The deterministic TypeScript engine returns **ALLOW**, **BLOCK**, or **REQUIRE_APPROVAL** with an explanation and matching policy. Its scenario runner lets developers check expected decisions before shipping policy changes.
 
 ## Included in this release
 
@@ -10,14 +10,15 @@ Backstop evaluates proposed tool actions before an application executes them. Th
 - Fail-safe handling for incomplete or unknown actions.
 - Locked baseline blocks for destructive deletion and money transfers.
 - Restrictive custom rules, a local approval queue, request filters, audit timeline, and JSON export.
+- **Model-free policy scenario runner** with machine-readable pass/fail reports for regression checks.
 - Responsive local developer console, unit tests, and CI.
-- No AI API, paid credits, database, or account required for the local console.
+- No AI API, paid credits, database, or account required for the local console or policy scenario runner.
 
 ## Important boundary
 
-This is a **local development console, not yet a hosted multi-user enforcement service**. Requests, rules, approval decisions, and audit entries live in this browser profile and can be modified by its owner. Backstop does not control another AI agent or execute real operations. Do not use the console as a production security boundary.
+This is a **local development console and policy library, not yet a hosted multi-user enforcement service**. Requests, rules, approval decisions, and audit entries in the browser live in that browser profile and can be modified by its owner. Backstop does not control another AI agent or execute real operations. Do not use the console as a production security boundary.
 
-Production enforcement requires an authenticated server-side execution gate, trusted agent identity, persisted and authenticated approvals, organization isolation, replay/idempotency protections, trusted audit storage, integration tests, and independent security review. The policy engine is a starting component, not a claim of complete agent security.
+Production enforcement requires an authenticated server-side execution gate, trusted agent identity, persisted and authenticated approvals, organization isolation, replay/idempotency protections, trusted audit storage, integration tests, and independent security review. The policy engine and scenario runner are components, not a claim of complete agent security.
 
 ## Run locally
 
@@ -31,6 +32,12 @@ Run validation:
     npm test
     npm run check
     npm run build
+
+## Test policy changes
+
+Import the scenario runner from `@backstop/core/scenarios` to define actions and expected decisions in code. It reports unexpected decisions as failures, includes the reason and policy version, and makes no AI API calls.
+
+See [Policy scenario testing](docs/policy-testing.md) for a complete example.
 
 ## Integration pattern
 
@@ -63,12 +70,14 @@ The server must independently authenticate the agent, validate the resource and 
 3. Custom rules may restrict access; they cannot grant permissions.
 4. Explain decisions and identify the matching policy.
 5. Treat local logs as development evidence, not tamper-proof compliance records.
+6. Test expected policy outcomes before integrating with real tools.
 
 ## Roadmap
 
 - [x] Deterministic TypeScript core
 - [x] Local browser console and review workflow
 - [x] Restrictive rules and local audit export
+- [x] Model-free policy scenario runner and regression tests
 - [x] Unit tests and CI workflow
 - [ ] Server-side enforcement API and tool adapters
 - [ ] Authenticated users, agent identities, and tenant isolation
@@ -76,4 +85,4 @@ The server must independently authenticate the agent, validate the resource and 
 - [ ] Bypass, replay, and integration tests
 - [ ] Independent security review
 
-BACKSTOP is early-stage software. Specific integrations, threat models, and reproducible test cases matter more than claims about what the product might become.
+BACKSTOP is early-stage software. The agent-governance space already has capable projects, so the long-term opportunity must be earned through a specific user problem, reliable integrations, and reproducible tests—not claims about what the product might become.
