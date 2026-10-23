@@ -53,6 +53,8 @@ const gate = createExecutionGate(serverRegisteredTools, storage);
 
 The approval service exposes `listPending(organizationId, limit, offset)` and `review({ organizationId, requestId, reviewerId, outcome })`. Call these only from authenticated server routes. Derive the organization and reviewer from trusted session/membership data—not from caller-supplied JSON. An approval result returns one-time evidence; pass that evidence back to `gate.invoke` for the same request and payload. Review approval IDs are generated from the runtime's cryptographic UUID source.
 
+The same module also exports `createPostgresPolicyService`, which validates restrictive rules, publishes an immutable versioned revision in a single transaction, retains previous revisions, and records a `POLICY_PUBLISHED` audit event. Its `loadCurrent(organizationId)` method returns the active version and rules. Use the organization policy-management authorization callback on every publish call.
+
 The adapter uses parameterized SQL and database transactions for one-time approval consumption and execution claims. It does not provision PostgreSQL, perform login/session authentication, implement your application's real ACL, or deploy a website. Those remain responsibilities of the host application. Test the real database, role permissions, approval routes, resource ACLs, migration and agent-tool adapter before any production use.
 
 ## The security flow
